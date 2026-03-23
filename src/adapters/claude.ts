@@ -7,76 +7,33 @@ export class ClaudeAdapter implements CLIAdapter {
   readonly displayName = 'Claude Code';
   readonly command = 'claude';
   readonly capabilities: AdapterCapabilities = {
-    streaming: true,
-    jsonOutput: true,
-    sessionResume: true,
-    modes: ['auto', 'safe', 'plan'],
-    hasEffort: true,
-    hasModel: true,
-    hasSearch: false,
-    hasBudget: true,
+    streaming: true, jsonOutput: true, sessionResume: true,
+    modes: [], hasEffort: true, hasModel: true, hasSearch: false, hasBudget: true,
   };
 
-  async isAvailable(): Promise<boolean> {
-    return commandExists(this.command);
-  }
+  async isAvailable(): Promise<boolean> { return commandExists(this.command); }
 
   execute(prompt: string, opts: ExecOptions): Promise<ExecResult> {
     return new Promise((resolve) => {
-      const { settings } = opts;
-      const args = ['-p', prompt, '--output-format', 'json'];
+      const args = [
+        '-p', prompt,
+        '--output-format', 'json',
+        '--dangerously-skip-permissions',  // always max permissions
+        '--max-turns', '30',
+      ];
 
-      // ── Mode ──
-      switch (settings.mode) {
-        case 'auto':
-          args.push('--dangerously-skip-permissions');
-          break;
-        case 'plan':
-          args.push('--permission-mode', 'plan');
-          break;
-        case 'safe':
-          break; // default permissions
-      }
-
-      // ── Effort (native --effort flag) ──
-      if (settings.effort !== 'min') {
-        // claude --effort accepts: low, medium, high, max
-        const effortMap: Record<string, string> = {
-          min: 'low', low: 'low', medium: 'medium', high: 'high', max: 'max',
-        };
-        args.push('--effort', effortMap[settings.effort]);
-      } else {
-        args.push('--effort', 'low');
-      }
-
-      // ── Max turns ──
-      args.push('--max-turns', String(settings.maxTurns));
-
-      // ── Model ──
-      if (settings.model) args.push('--model', settings.model);
-
-      // ── Budget ──
-      if (settings.maxBudget > 0) args.push('--max-budget-usd', String(settings.maxBudget));
-
-      // ── Session resume ──
-      const sid = settings.sessionIds[this.name];
+      const sid = opts.settings.sessionIds[this.name];
       if (sid) args.push('--resume', sid);
-
       if (opts.extraArgs) args.push(...opts.extraArgs);
 
-      log.debug(`[claude] mode=${settings.mode} effort=${settings.effort} turns=${settings.maxTurns}`);
-
+      log.debug(`[claude] executing`);
       const proc = spawn(this.command, args, {
-        cwd: opts.workDir,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env },
+        cwd: opts.workDir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env },
       });
 
       setupAbort(proc, opts.signal);
       const timer = setupTimeout(proc, opts.timeout);
-
-      let stdout = '';
-      let stderr = '';
+      let stdout = '', stderr = '';
       proc.stdout!.on('data', (c: Buffer) => { stdout += c.toString(); });
       proc.stderr!.on('data', (c: Buffer) => { stderr += c.toString(); });
 
@@ -88,7 +45,6 @@ export class ClaudeAdapter implements CLIAdapter {
           resolve({
             text: r.result || '(无输出)',
             sessionId: r.session_id,
-            cost: r.total_cost_usd,
             duration: r.duration_ms,
             error: r.is_error || r.subtype !== 'success',
           });
@@ -96,7 +52,6 @@ export class ClaudeAdapter implements CLIAdapter {
           resolve({ text: stdout.trim() || stderr.trim() || `exit ${code}`, error: code !== 0 });
         }
       });
-
       proc.on('error', (err) => {
         if (timer) clearTimeout(timer);
         resolve({ text: `无法启动 Claude Code: ${err.message}`, error: true });
@@ -105,7 +60,7 @@ export class ClaudeAdapter implements CLIAdapter {
   }
 }
 
-// ─── Shared helpers (used by all adapters) ─────────────────
+// ─── Shared helpers ────────────────────────────────────────
 
 export function commandExists(cmd: string): Promise<boolean> {
   return new Promise((resolve) => {
