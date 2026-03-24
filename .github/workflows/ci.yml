@@ -35,62 +35,38 @@ jobs:
       - name: Test config module
         run: node -e "import('./dist/config.js').then(m => { m.ensureDataDir(); console.log('Config OK:', JSON.stringify(m.loadConfig())); })"
 
-      - name: Test commandExists (platform-specific)
-        run: node -e "import('./dist/adapters/claude.js').then(async m => { const exists = await m.commandExists('node'); console.log('commandExists(node):', exists); if (!exists) { console.error('FAIL: commandExists should find node'); process.exit(1); } })"
+      - name: Test commandExists
+        run: node -e "import('./dist/adapters/claude.js').then(async m => { const ok = await m.commandExists('node'); console.log('commandExists(node):', ok); if (!ok) process.exit(1); })"
 
       - name: Test spawnOpts shell flag
-        run: >
+        shell: bash
+        run: |
           node -e "
             import('./dist/adapters/claude.js').then(m => {
               const opts = m.spawnOpts('/tmp');
               const isWin = process.platform === 'win32';
-              console.log('platform:', process.platform);
-              console.log('spawnOpts.shell:', opts.shell);
-              if (isWin && !opts.shell) {
-                console.error('FAIL: spawnOpts must set shell=true on Windows');
-                process.exit(1);
-              }
-              if (!isWin && opts.shell) {
-                console.error('FAIL: spawnOpts should not set shell=true on non-Windows');
-                process.exit(1);
-              }
-              console.log('spawnOpts shell flag: PASS');
+              console.log('platform:', process.platform, 'shell:', opts.shell);
+              if (isWin && !opts.shell) { console.error('FAIL: must be shell:true on Windows'); process.exit(1); }
+              if (!isWin && opts.shell) { console.error('FAIL: should not be shell:true on non-Windows'); process.exit(1); }
+              console.log('PASS');
             })
           "
 
-      - name: Test spawn with shell (Windows .cmd simulation)
+      - name: Test spawn with shell on Windows
         if: runner.os == 'Windows'
-        run: >
+        shell: bash
+        run: |
           node -e "
             import { spawn } from 'child_process';
             import('./dist/adapters/claude.js').then(m => {
               const opts = m.spawnOpts();
               const proc = spawn('where', ['node'], { ...opts, stdio: 'pipe' });
               let out = '';
-              proc.stdout.on('data', c => out += c);
+              proc.stdout.on('data', c => { out += c; });
               proc.on('close', code => {
-                console.log('where node:', out.trim());
-                if (code !== 0) { console.error('FAIL: spawn where node failed'); process.exit(1); }
-                console.log('Windows spawn with shell: PASS');
+                console.log('where node:', out.trim().split('\n')[0]);
+                if (code !== 0) { console.error('FAIL'); process.exit(1); }
+                console.log('PASS: Windows spawn with shell works');
               });
             })
-          "
-
-      - name: Test spawn without shell should fail on Windows
-        if: runner.os == 'Windows'
-        run: >
-          node -e "
-            import { spawn } from 'child_process';
-            const proc = spawn('where', ['node'], { stdio: 'pipe' });
-            proc.on('error', err => {
-              if (err.code === 'ENOENT') {
-                console.log('PASS: spawn without shell correctly fails with ENOENT on Windows');
-                process.exit(0);
-              }
-              process.exit(1);
-            });
-            proc.on('close', code => {
-              console.log('NOTE: where works without shell on this runner (Git Bash in PATH)');
-              console.log('spawnOpts shell:true is still required for .cmd wrappers');
-            });
           "
