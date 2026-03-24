@@ -16,7 +16,10 @@ export class GeminiAdapter implements CLIAdapter {
   execute(prompt: string, opts: ExecOptions): Promise<ExecResult> {
     return new Promise((resolve) => {
       const { settings } = opts;
-      const args = ['-p', prompt, '--output-format', 'json'];
+      // Pass prompt via stdin to avoid Windows cmd.exe special-character issues
+      // (e.g. "|" in quoted messages being interpreted as a pipe by cmd.exe with shell:true).
+      // Non-TTY stdin + --output-format json triggers headless mode without needing -p.
+      const args = ['--output-format', 'json'];
 
       // Approval mode (default to yolo)
       args.push('--approval-mode', settings.approvalMode || 'yolo');
@@ -41,8 +44,13 @@ export class GeminiAdapter implements CLIAdapter {
 
       log.debug(`[gemini] approval=${settings.approvalMode || 'yolo'} model=${settings.model || 'default'}`);
       const proc = spawnProc(this.command, args, {
-        cwd: settings.workDir || opts.workDir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env },
+        cwd: settings.workDir || opts.workDir, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env },
       });
+
+      // Write prompt to stdin
+      log.debug(`[gemini] stdin: ${prompt.substring(0, 200)}${prompt.length > 200 ? '…' : ''}`);
+      proc.stdin!.write(prompt, 'utf8');
+      proc.stdin!.end();
 
       setupAbort(proc, opts.signal);
       const timer = setupTimeout(proc, opts.timeout);

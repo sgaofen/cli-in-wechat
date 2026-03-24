@@ -8,7 +8,7 @@ import type { BridgeConfig } from '../config.js';
 import type { AskUserRequest } from '../adapters/base.js';
 
 interface ActiveTask { abort: AbortController; tool: string }
-interface PendingQuestion { resolve: (answer: string) => void; timeout: ReturnType<typeof setTimeout> }
+interface PendingQuestion { resolve: (answer: string) => void; timeout: ReturnType<typeof setTimeout>; toolName: string }
 
 const TOOL_ALIASES: Record<string, string> = {
   claude: 'claude', cc: 'claude',
@@ -35,33 +35,40 @@ export class Router {
   }
 
   start(): void {
-    this.ilink.onMessage((msg, text) => {
-      this.handle(msg, text).catch((e) => log.error('路由异常:', e));
+    this.ilink.onMessage((msg, text, refText) => {
+      this.handle(msg, text, refText).catch((e) => log.error('路由异常:', e));
     });
   }
 
-  private async handle(msg: WeixinMessage, text: string): Promise<void> {
+  private resolveToolFromRefText(refText: string): string | undefined {
+    // Parse tool from footer: "— DisplayName | ..."
+    const footerMatch = refText.match(/— ([^\|\n]+?)(?:\s*\||\s*$)/m);
+    if (footerMatch) return this.registry.getNameByDisplayName(footerMatch[1].trim());
+    return undefined;
+  }
+
+  // ── getCli: determine terminal from @mention → ref footer → current session ──
+  private getCli(uid: string, text: string, refText?: string): string {
+    const atMatch = text.match(/^@(\w+)/);
+    if (atMatch) {
+      const resolved = TOOL_ALIASES[atMatch[1].toLowerCase()];
+      if (resolved && this.registry.isAvailable(resolved)) return resolved;
+    }
+    if (refText) {
+      const resolved = this.resolveToolFromRefText(refText);
+      if (resolved && this.registry.isAvailable(resolved)) return resolved;
+    }
+    return this.sessions.get(uid).defaultTool || this.config.defaultTool;
+  }
+
+
+  private async handle(msg: WeixinMessage, text: string, refText: string): Promise<void> {
     const uid = msg.from_user_id;
     if (this.config.allowedUsers.length > 0 && !this.config.allowedUsers.includes(uid)) return;
 
     const trimmed = text.trim();
 
-    // ── Answer pending AskUserQuestion ──
-    const pending = this.pendingQuestions.get(uid);
-    if (pending) {
-      clearTimeout(pending.timeout);
-      this.pendingQuestions.delete(uid);
-      pending.resolve(trimmed);
-      return;
-    }
-
-    // Busy check
-    if (this.active.has(uid)) {
-      await this.ilink.sendText(uid, '处理中...');
-      return;
-    }
-
-    // ── /command → ALL / messages are commands, never pass through ──
+    // ── /command ──
     if (trimmed.startsWith('/')) {
       await this.handleSlash(uid, trimmed);
       return;
@@ -91,58 +98,54 @@ export class Router {
         await this.ilink.sendText(uid, '没有上一条回复可接力');
         return;
       }
-
-      // >> @tool prompt  →  relay to specific tool
-      let tool: string | undefined;
-      let prompt = rest;
-      const atMatch = rest.match(/^@(\w+)[\s：:]\s*([\s\S]+)$/);
-      if (atMatch) {
-        const resolved = TOOL_ALIASES[atMatch[1].toLowerCase()];
-        if (resolved && this.registry.isAvailable(resolved)) {
-          tool = resolved;
-          prompt = atMatch[2].trim();
-          this.sessions.update(uid, { defaultTool: resolved });
-        }
-      }
-
-      const toolName = tool || this.sessions.get(uid).defaultTool || this.config.defaultTool;
+      const atRelayMatch = rest.match(/^@(\w+)[\s：:]\s*([\s\S]+)$/);
+      const prompt = atRelayMatch ? atRelayMatch[2].trim() : rest;
+      const toolName = this.getCli(uid, rest, refText);
+      this.sessions.update(uid, { defaultTool: toolName });
       if (this.active.has(`${uid}:${toolName}`)) { await this.ilink.sendText(uid, `${toolName} 在忙`); return; }
       const fullPrompt = `以下是 ${prev.tool} 的输出:\n\n${prev.text}\n\n---\n\n${prompt}`;
       await this.exec(uid, toolName, fullPrompt);
       return;
     }
 
-    // Pattern: @tool  or  @tool prompt  →  switch tool, optionally send prompt
+    // ── @mention 合法性校验 ──
     const atMatch = trimmed.match(/^@(\w+)(?:[\s：:]\s*([\s\S]+))?$/);
-    if (atMatch) {
-      const alias = atMatch[1].toLowerCase();
-      const resolved = TOOL_ALIASES[alias];
-      if (!resolved) {
-        await this.ilink.sendText(uid, `未知终端: @${atMatch[1]}\n可用: ${Object.keys(TOOL_ALIASES).join(', ')}`);
-        return;
-      }
-      if (!this.registry.isAvailable(resolved)) {
-        await this.ilink.sendText(uid, `"${resolved}" 不可用\n可用: ${this.registry.getAvailableNames().join(', ')}`);
-        return;
-      }
-      this.sessions.update(uid, { defaultTool: resolved });
-      if (!atMatch[2]) {
-        await this.ilink.sendText(uid, `已切换到 ${resolved}`);
-        return;
-      }
-      if (this.active.has(`${uid}:${resolved}`)) { await this.ilink.sendText(uid, `${resolved} 在忙`); return; }
-      await this.exec(uid, resolved, atMatch[2].trim());
+    if (atMatch && !TOOL_ALIASES[atMatch[1].toLowerCase()]) {
+      await this.ilink.sendText(uid, `未知终端: @${atMatch[1]}\n可用: ${Object.keys(TOOL_ALIASES).join(', ')}`);
       return;
     }
 
-    // Plain text → send to current default tool
-    const toolName = this.sessions.get(uid).defaultTool || this.config.defaultTool;
+    const toolName = this.getCli(uid, trimmed, refText);
+
+    // ── If a tool is waiting for AskUser reply, resolve it before normal execution ──
+    const pendingKey = `${uid}:${toolName}`;
+    const pending = this.pendingQuestions.get(pendingKey);
+    if (pending && trimmed) {
+      clearTimeout(pending.timeout);
+      this.pendingQuestions.delete(pendingKey);
+      pending.resolve(trimmed);
+      return;
+    }
+
+    // ── getCli 决定终端，立即切换 defaultTool ──
+    this.sessions.update(uid, { defaultTool: toolName });
+
     if (!this.registry.isAvailable(toolName)) {
       await this.ilink.sendText(uid, `"${toolName}" 不可用\n可用: ${this.registry.getAvailableNames().join(', ')}`);
       return;
     }
+
+    // @tool 无 prompt → 仅切换，确认后返回
+    if (atMatch && !atMatch[2]) {
+      await this.ilink.sendText(uid, `已切换到 ${toolName}`);
+      return;
+    }
+
     if (this.active.has(`${uid}:${toolName}`)) { await this.ilink.sendText(uid, `${toolName} 在忙`); return; }
-    await this.exec(uid, toolName, trimmed);
+
+    const prompt = atMatch ? atMatch[2].trim() : trimmed;
+    const combined = [prompt, refText].filter(Boolean).join('\n\n');
+    await this.exec(uid, toolName, combined);
   }
 
   // ─── /command → ALL are commands, never pass through ────
@@ -727,7 +730,7 @@ export class Router {
     if (signal.aborted) return { result: { text: '已取消', error: true }, notice: '' };
     const result = await adapter.execute(prompt, {
       settings: this.sessions.get(uid), workDir: this.config.workDir, timeout: this.config.cliTimeout, extraArgs, signal,
-      askUser: (req) => this.askUserViaWeChat(uid, req),
+      askUser: (req) => this.askUserViaWeChat(uid, toolName, req),
     });
 
     if (result.sessionExpired && hadSession && !signal.aborted) {
@@ -742,9 +745,12 @@ export class Router {
 
   // ─── AskUserQuestion via WeChat ─────────────────────────
 
-  private async askUserViaWeChat(uid: string, req: AskUserRequest): Promise<Record<string, string>> {
+  private async askUserViaWeChat(uid: string, toolName: string, req: AskUserRequest): Promise<Record<string, string>> {
+    const adapter = this.registry.get(toolName);
+    const displayName = adapter?.displayName ?? toolName;
+
     // Format questions for WeChat display
-    const lines: string[] = ['Claude 需要你的回答:'];
+    const lines: string[] = [`${displayName} 需要你的回答:`];
     for (const q of req.questions) {
       lines.push('');
       lines.push(`❓ ${q.question}`);
@@ -753,18 +759,18 @@ export class Router {
       });
       if (q.multiSelect) lines.push('  (可多选，用逗号分隔数字)');
     }
-    lines.push('');
-    lines.push('请直接回复选项编号或内容:');
+    lines.push(`— ${displayName} | 等待回复`);
 
     await this.ilink.sendText(uid, lines.join('\n'));
 
-    // Wait for user reply (timeout 5 min)
+    // Wait for user reply (timeout 5 min); key: "${uid}:${toolName}" for concurrent support
+    const pendingKey = `${uid}:${toolName}`;
     const reply = await new Promise<string>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        this.pendingQuestions.delete(uid);
+        this.pendingQuestions.delete(pendingKey);
         reject(new Error('回复超时'));
       }, 300_000);
-      this.pendingQuestions.set(uid, { resolve, timeout });
+      this.pendingQuestions.set(pendingKey, { resolve, timeout, toolName });
     });
 
     // Parse reply → map to question answers
@@ -808,8 +814,9 @@ export class Router {
         this.sessions.setSession(uid, toolName, result.sessionId);
       }
 
-      // Store for >> relay
+      // Store for >> relay; auto-switch defaultTool to last used tool
       this.lastResponse.set(uid, { tool: adapter.displayName, text: result.text });
+      this.sessions.update(uid, { defaultTool: toolName });
 
       await this.ilink.sendText(uid, formatResponse(notice + result.text, {
         tool: adapter.displayName,

@@ -20,7 +20,7 @@ export class CodexAdapter implements CLIAdapter {
       const hasSession = settings.sessionIds[this.name];
 
       if (hasSession) {
-        args.push('exec', 'resume', '--last', prompt);
+        args.push('exec', 'resume', '--last');
       } else {
         args.push('exec');
 
@@ -49,16 +49,19 @@ export class CodexAdapter implements CLIAdapter {
 
         // Add directory
         if (settings.addDir) args.push('--add-dir', settings.addDir);
-
-        args.push(prompt);
       }
 
       if (opts.extraArgs) args.push(...opts.extraArgs);
 
       log.debug(`[codex] mode=${settings.mode} sandbox=${settings.sandbox || 'yolo'} search=${settings.search}`);
       const proc = spawnProc(this.command, args, {
-        cwd: opts.workDir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env },
+        cwd: opts.workDir, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env },
       });
+
+      // Pass prompt via stdin to avoid Windows cmd.exe Unicode encoding issues
+      log.debug(`[codex] stdin: ${prompt.substring(0, 200)}${prompt.length > 200 ? '…' : ''}`);
+      proc.stdin!.write(prompt, 'utf8');
+      proc.stdin!.end();
 
       setupAbort(proc, opts.signal);
       const timer = setupTimeout(proc, opts.timeout);

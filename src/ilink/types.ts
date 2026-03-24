@@ -59,6 +59,9 @@ export interface RefMsg {
 
 export interface MessageItem {
   type: 1 | 2 | 3 | 4 | 5;
+  create_time_ms?: number;
+  update_time_ms?: number;
+  is_completed?: boolean;
   text_item?: TextItem;
   image_item?: ImageItem;
   voice_item?: VoiceItem;
