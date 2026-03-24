@@ -390,19 +390,6 @@ export class MyToolAdapter implements CLIAdapter {
 - **限制**: 仅私聊 (暂不支持群聊)、无消息历史 API
 - **官方通道，不封号**
 
-## 与 claude-plugin-weixin 的区别
-
-| | [claude-plugin-weixin](https://github.com/m1heng/claude-plugin-weixin) | **cli-in-wechat** |
-|---|---|---|
-| CLI 工具 | 仅 Claude Code | Claude + Codex + Gemini + Kimi + 可扩展 |
-| 能用吗 | ❌ 依赖实验性 `claude/channel`，目前被禁用 | ✅ 直接调 `-p` 模式 + Agent SDK |
-| 架构 | MCP 插件 (绑定 Claude 插件系统) | 独立服务 (不依赖任何插件系统) |
-| AskUserQuestion | 不支持 | ✅ 通过 Agent SDK 转发到微信 |
-| 权限控制 | 无 | 40+ 命令覆盖所有 flag |
-| 会话续接 | 无 | 四个工具全支持 |
-| 工具协作 | 无 | `>>` 接力 + `@tool1>tool2` 链式 |
-| 跨通道 | 无 | `/session set` 漫游 |
-
 ## License
 
 MIT
