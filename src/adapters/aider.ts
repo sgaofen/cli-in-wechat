@@ -1,7 +1,6 @@
-import { spawn } from 'node:child_process';
 import { log } from '../utils/logger.js';
-import { commandExists, setupAbort, setupTimeout, stripAnsi } from './claude.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
+import { commandExists, spawnProc, setupAbort, setupTimeout, stripAnsi } from './base.js';
 
 export class AiderAdapter implements CLIAdapter {
   readonly name = 'aider';
@@ -44,7 +43,7 @@ export class AiderAdapter implements CLIAdapter {
 
       log.debug(`[aider] mode=${settings.mode}`);
 
-      const proc = spawn(this.command, args, {
+      const proc = spawnProc(this.command, args, {
         cwd: opts.workDir,
         stdio: ['ignore', 'pipe', 'pipe'],
         env: { ...process.env },

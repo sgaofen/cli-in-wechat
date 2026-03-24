@@ -145,6 +145,7 @@ export class ILinkClient {
     // Cache context_token for this user
     this.contextTokens.set(msg.from_user_id, msg.context_token);
 
+    log.debug(`[msg] item_list=${JSON.stringify(msg.item_list)}`);
     const text = extractText(msg);
     if (!text) return;
 
@@ -300,14 +301,27 @@ export class ILinkClient {
 
 function extractText(msg: WeixinMessage): string {
   const parts: string[] = [];
+  let refText = '';
   for (const item of msg.item_list) {
     if (item.type === 1 && item.text_item?.text) {
       parts.push(item.text_item.text);
     } else if (item.type === 3 && item.voice_item?.text) {
       parts.push(item.voice_item.text); // voice-to-text transcription
     }
+    // Extract quoted message content (WeChat 引用消息)
+    const ref = item.ref_msg;
+    if (ref) {
+      const refItem = ref.message_item;
+      if (refItem?.text_item?.text) refText = refItem.text_item.text;
+      else if (refItem?.voice_item?.text) refText = refItem.voice_item.text;
+      else if (ref.title) refText = ref.title;
+      log.debug(`[extractText] ref_msg title=${JSON.stringify(ref.title)} extracted=${JSON.stringify(refText.substring(0, 80))}`);
+    }
   }
-  return parts.join('\n').trim();
+  // WeChat embeds quoted content inline as "[引用]:\n<content>" — strip the prefix
+  const text = parts.join('\n').trim().replace(/^\[引用\]:\n?/, '');
+  if (refText && refText !== text) return text ? `${text}：${refText}` : refText;
+  return text;
 }
 
 function chunkText(text: string, maxLen: number): string[] {

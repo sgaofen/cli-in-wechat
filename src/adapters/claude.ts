@@ -1,6 +1,6 @@
-import { spawn, type ChildProcess } from 'node:child_process';
 import { log } from '../utils/logger.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
+import { commandExists, spawnProc, setupAbort, setupTimeout, isSessionError } from './base.js';
 
 export class ClaudeAdapter implements CLIAdapter {
   readonly name = 'claude';
@@ -63,7 +63,7 @@ export class ClaudeAdapter implements CLIAdapter {
       if (opts.extraArgs) args.push(...opts.extraArgs);
 
       log.debug(`[claude] effort=${settings.effort} model=${settings.model || 'default'} mode=${settings.mode}`);
-      const proc = spawn(this.command, args, {
+      const proc = spawnProc(this.command, args, {
         cwd: settings.workDir || opts.workDir,
         stdio: ['ignore', 'pipe', 'pipe'],
         env: { ...process.env },
@@ -80,28 +80,15 @@ export class ClaudeAdapter implements CLIAdapter {
         if (opts.signal?.aborted) { resolve({ text: '已取消', error: true }); return; }
         try {
           const r = JSON.parse(stdout);
-          resolve({ text: r.result || '(无输出)', sessionId: r.session_id, duration: r.duration_ms, error: r.is_error || r.subtype !== 'success' });
+          const isErr = r.is_error || r.subtype !== 'success';
+          const text = r.result || '(无输出)';
+          resolve({ text, sessionId: r.session_id, duration: r.duration_ms, error: isErr, sessionExpired: isErr && !!sid && isSessionError(text) });
         } catch {
-          resolve({ text: stdout.trim() || stderr.trim() || `exit ${code}`, error: code !== 0 });
+          const text = stdout.trim() || stderr.trim() || `exit ${code}`;
+          resolve({ text, error: code !== 0, sessionExpired: code !== 0 && !!sid && isSessionError(text) });
         }
       });
       proc.on('error', (err) => { if (timer) clearTimeout(timer); resolve({ text: `无法启动 Claude Code: ${err.message}`, error: true }); });
     });
   }
-}
-
-// ─── Shared helpers ────────────────────────────────────────
-export function commandExists(cmd: string): Promise<boolean> {
-  const checker = process.platform === 'win32' ? 'where' : 'which';
-  return new Promise((resolve) => { const proc = spawn(checker, [cmd], { stdio: 'pipe' }); proc.on('close', (code) => resolve(code === 0)); proc.on('error', () => resolve(false)); });
-}
-export function setupAbort(proc: ChildProcess, signal?: AbortSignal): void {
-  if (!signal) return; if (signal.aborted) { proc.kill('SIGTERM'); return; }
-  const onAbort = () => proc.kill('SIGTERM'); signal.addEventListener('abort', onAbort, { once: true }); proc.on('close', () => signal.removeEventListener('abort', onAbort));
-}
-export function setupTimeout(proc: ChildProcess, timeout?: number): ReturnType<typeof setTimeout> | null {
-  if (!timeout) return null; return setTimeout(() => proc.kill('SIGTERM'), timeout);
-}
-export function stripAnsi(str: string): string {
-  return str.replace(/\x1B\[[0-9;]*[A-Za-z]/g, '').replace(/\x1B\][^\x07]*\x07/g, '').replace(/\r/g, '');
 }

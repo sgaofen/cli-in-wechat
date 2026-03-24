@@ -1,7 +1,6 @@
-import { spawn } from 'node:child_process';
 import { log } from '../utils/logger.js';
-import { commandExists, setupAbort, setupTimeout, stripAnsi } from './claude.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
+import { commandExists, spawnProc, setupAbort, setupTimeout, stripAnsi, isSessionError } from './base.js';
 
 export class CodexAdapter implements CLIAdapter {
   readonly name = 'codex';
@@ -57,7 +56,7 @@ export class CodexAdapter implements CLIAdapter {
       if (opts.extraArgs) args.push(...opts.extraArgs);
 
       log.debug(`[codex] mode=${settings.mode} sandbox=${settings.sandbox || 'yolo'} search=${settings.search}`);
-      const proc = spawn(this.command, args, {
+      const proc = spawnProc(this.command, args, {
         cwd: opts.workDir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env },
       });
 
@@ -72,7 +71,7 @@ export class CodexAdapter implements CLIAdapter {
         if (opts.signal?.aborted) { resolve({ text: '已取消', error: true }); return; }
         const text = stripAnsi(stdout.trim() || stderr.trim()) || `exit ${code}`;
         // Mark session exists so next call uses --last to resume
-        resolve({ text, sessionId: code === 0 ? 'last' : undefined, error: code !== 0 });
+        resolve({ text, sessionId: code === 0 ? 'last' : undefined, error: code !== 0, sessionExpired: code !== 0 && !!hasSession && isSessionError(text) });
       });
       proc.on('error', (err) => {
         if (timer) clearTimeout(timer);

@@ -42,12 +42,6 @@ export class Router {
 
     const trimmed = text.trim();
 
-    // Busy check
-    if (this.active.has(uid)) {
-      await this.ilink.sendText(uid, '处理中...');
-      return;
-    }
-
     // ── /command → ALL / messages are commands, never pass through ──
     if (trimmed.startsWith('/')) {
       await this.handleSlash(uid, trimmed);
@@ -63,6 +57,8 @@ export class Router {
       const t2 = TOOL_ALIASES[chainMatch[2].toLowerCase()];
       const prompt = chainMatch[3].trim();
       if (t1 && t2 && this.registry.isAvailable(t1) && this.registry.isAvailable(t2)) {
+        const busy = [t1, t2].find(t => this.active.has(`${uid}:${t}`));
+        if (busy) { await this.ilink.sendText(uid, `${busy} 在忙`); return; }
         await this.chain(uid, t1, t2, prompt);
         return;
       }
@@ -80,7 +76,7 @@ export class Router {
       // >> @tool prompt  →  relay to specific tool
       let tool: string | undefined;
       let prompt = rest;
-      const atMatch = rest.match(/^@(\w+)\s+([\s\S]+)$/);
+      const atMatch = rest.match(/^@(\w+)[\s：:]\s*([\s\S]+)$/);
       if (atMatch) {
         const resolved = TOOL_ALIASES[atMatch[1].toLowerCase()];
         if (resolved && this.registry.isAvailable(resolved)) {
@@ -91,31 +87,43 @@ export class Router {
       }
 
       const toolName = tool || this.sessions.get(uid).defaultTool || this.config.defaultTool;
+      if (this.active.has(`${uid}:${toolName}`)) { await this.ilink.sendText(uid, `${toolName} 在忙`); return; }
       const fullPrompt = `以下是 ${prev.tool} 的输出:\n\n${prev.text}\n\n---\n\n${prompt}`;
       await this.exec(uid, toolName, fullPrompt);
       return;
     }
 
-    // Pattern: @tool prompt  →  single tool
-    let tool: string | undefined;
-    let prompt = trimmed;
-    const atMatch = trimmed.match(/^@(\w+)\s+([\s\S]+)$/);
+    // Pattern: @tool  or  @tool prompt  →  switch tool, optionally send prompt
+    const atMatch = trimmed.match(/^@(\w+)(?:[\s：:]\s*([\s\S]+))?$/);
     if (atMatch) {
-      const resolved = TOOL_ALIASES[atMatch[1].toLowerCase()];
-      if (resolved && this.registry.isAvailable(resolved)) {
-        tool = resolved;
-        prompt = atMatch[2].trim();
-        this.sessions.update(uid, { defaultTool: resolved });
+      const alias = atMatch[1].toLowerCase();
+      const resolved = TOOL_ALIASES[alias];
+      if (!resolved) {
+        await this.ilink.sendText(uid, `未知终端: @${atMatch[1]}\n可用: ${Object.keys(TOOL_ALIASES).join(', ')}`);
+        return;
       }
+      if (!this.registry.isAvailable(resolved)) {
+        await this.ilink.sendText(uid, `"${resolved}" 不可用\n可用: ${this.registry.getAvailableNames().join(', ')}`);
+        return;
+      }
+      this.sessions.update(uid, { defaultTool: resolved });
+      if (!atMatch[2]) {
+        await this.ilink.sendText(uid, `已切换到 ${resolved}`);
+        return;
+      }
+      if (this.active.has(`${uid}:${resolved}`)) { await this.ilink.sendText(uid, `${resolved} 在忙`); return; }
+      await this.exec(uid, resolved, atMatch[2].trim());
+      return;
     }
 
-    const toolName = tool || this.sessions.get(uid).defaultTool || this.config.defaultTool;
+    // Plain text → send to current default tool
+    const toolName = this.sessions.get(uid).defaultTool || this.config.defaultTool;
     if (!this.registry.isAvailable(toolName)) {
       await this.ilink.sendText(uid, `"${toolName}" 不可用\n可用: ${this.registry.getAvailableNames().join(', ')}`);
       return;
     }
-
-    await this.exec(uid, toolName, prompt);
+    if (this.active.has(`${uid}:${toolName}`)) { await this.ilink.sendText(uid, `${toolName} 在忙`); return; }
+    await this.exec(uid, toolName, trimmed);
   }
 
   // ─── /command → ALL are commands, never pass through ────
@@ -217,9 +225,12 @@ export class Router {
         return true;
 
       case 'cancel': case 'c': {
-        const task = this.active.get(uid);
-        if (task) { task.abort.abort(); this.active.delete(uid); await reply(`已取消 ${task.tool}`); }
-        else { await reply('无任务'); }
+        const tasks = [...this.active.entries()].filter(([k]) => k.startsWith(`${uid}:`));
+        if (tasks.length > 0) {
+          const seen = new Set<AbortController>();
+          tasks.forEach(([k, t]) => { if (!seen.has(t.abort)) { seen.add(t.abort); t.abort.abort(); } this.active.delete(k); });
+          await reply(`已取消 ${[...new Set(tasks.map(([, t]) => t.tool))].join(', ')}`);
+        } else { await reply('无任务'); }
         return true;
       }
 
@@ -591,23 +602,19 @@ export class Router {
     if (!adapter1 || !adapter2) return;
 
     const abort = new AbortController();
-    this.active.set(uid, { abort, tool: `${tool1}>${tool2}` });
+    this.active.set(`${uid}:${tool1}`, { abort, tool: `${tool1}>${tool2}` });
+    this.active.set(`${uid}:${tool2}`, { abort, tool: `${tool1}>${tool2}` });
     const stopTyping = await this.ilink.startTyping(uid);
     const start = Date.now();
 
     try {
-      const settings = this.sessions.get(uid);
-
       // Step 1: run tool1
       log.debug(`[chain] step1: ${tool1}`);
-      const r1 = await adapter1.execute(prompt, {
-        settings, workDir: this.config.workDir,
-        timeout: this.config.cliTimeout, signal: abort.signal,
-      });
+      const { result: r1, notice: n1 } = await this.runOnce(tool1, uid, prompt, abort.signal);
 
       if (abort.signal.aborted || r1.error) {
         if (!abort.signal.aborted) {
-          await this.ilink.sendText(uid, formatResponse(r1.text, { tool: adapter1.displayName, error: true }));
+          await this.ilink.sendText(uid, formatResponse(n1 + r1.text, { tool: adapter1.displayName, error: true }));
         }
         return;
       }
@@ -620,10 +627,7 @@ export class Router {
       log.debug(`[chain] step2: ${tool2}`);
       const chainPrompt = `以下是 ${adapter1.displayName} 对「${prompt}」的分析结果:\n\n${r1.text}\n\n---\n\n请基于以上内容继续工作。`;
 
-      const r2 = await adapter2.execute(chainPrompt, {
-        settings, workDir: this.config.workDir,
-        timeout: this.config.cliTimeout, signal: abort.signal,
-      });
+      const { result: r2, notice: n2 } = await this.runOnce(tool2, uid, chainPrompt, abort.signal);
 
       if (abort.signal.aborted) return;
 
@@ -635,7 +639,7 @@ export class Router {
       this.lastResponse.set(uid, { tool: adapter2.displayName, text: r2.text });
 
       const elapsed = Date.now() - start;
-      await this.ilink.sendText(uid, formatResponse(r2.text, {
+      await this.ilink.sendText(uid, formatResponse(n2 + r2.text, {
         tool: `${adapter1.displayName} → ${adapter2.displayName}`,
         duration: elapsed,
         error: r2.error,
@@ -647,8 +651,37 @@ export class Router {
       }
     } finally {
       stopTyping();
-      this.active.delete(uid);
+      this.active.delete(`${uid}:${tool1}`);
+      this.active.delete(`${uid}:${tool2}`);
     }
+  }
+
+  // ─── Execute once, clean up stale session on failure ─
+  // Executes the prompt exactly once. On failure, if a session was active,
+  // clears it so the next request gets a fresh session — but does NOT
+  // re-execute, because the prompt may have had side-effects.
+
+  private async runOnce(
+    toolName: string,
+    uid: string,
+    prompt: string,
+    signal: AbortSignal,
+  ): Promise<{ result: import('../adapters/base.js').ExecResult; notice: string }> {
+    const adapter = this.registry.get(toolName)!;
+    const extraArgs = this.config.tools[toolName]?.args;
+    const hadSession = adapter.capabilities.sessionResume && !!this.sessions.get(uid).sessionIds[toolName];
+
+    if (signal.aborted) return { result: { text: '已取消', error: true }, notice: '' };
+    const result = await adapter.execute(prompt, {
+      settings: this.sessions.get(uid), workDir: this.config.workDir, timeout: this.config.cliTimeout, extraArgs, signal,
+    });
+
+    if (result.sessionExpired && hadSession && !signal.aborted) {
+      log.warn(`[${toolName}] 会话已过期，已清除旧会话`);
+      this.sessions.clearSession(uid, toolName);
+      return { result, notice: '[会话已过期并自动清除，如需重试请重新发送]\n\n' };
+    }
+    return { result, notice: '' };
   }
 
   // ─── Execute single tool ──────────────────────────────
@@ -658,19 +691,12 @@ export class Router {
     if (!adapter) return;
 
     const abort = new AbortController();
-    this.active.set(uid, { abort, tool: toolName });
+    this.active.set(`${uid}:${toolName}`, { abort, tool: toolName });
     const stopTyping = await this.ilink.startTyping(uid);
     const start = Date.now();
 
     try {
-      const settings = this.sessions.get(uid);
-
-      const result = await adapter.execute(prompt, {
-        settings, workDir: this.config.workDir,
-        timeout: this.config.cliTimeout,
-        extraArgs: this.config.tools[toolName]?.args,
-        signal: abort.signal,
-      });
+      const { result, notice } = await this.runOnce(toolName, uid, prompt, abort.signal);
 
       if (abort.signal.aborted) return;
 
@@ -681,7 +707,7 @@ export class Router {
       // Store for >> relay
       this.lastResponse.set(uid, { tool: adapter.displayName, text: result.text });
 
-      await this.ilink.sendText(uid, formatResponse(result.text, {
+      await this.ilink.sendText(uid, formatResponse(notice + result.text, {
         tool: adapter.displayName,
         duration: result.duration || (Date.now() - start),
         error: result.error,
@@ -693,7 +719,7 @@ export class Router {
       }
     } finally {
       stopTyping();
-      this.active.delete(uid);
+      this.active.delete(`${uid}:${toolName}`);
     }
   }
 }
