@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { log } from '../utils/logger.js';
-import { commandExists, setupAbort, setupTimeout, stripAnsi } from './claude.js';
+import { commandExists, setupAbort, setupTimeout, stripAnsi, spawnOpts } from './claude.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
 
 export class GeminiAdapter implements CLIAdapter {
@@ -42,7 +42,7 @@ export class GeminiAdapter implements CLIAdapter {
 
       log.debug(`[gemini] approval=${settings.approvalMode || 'yolo'} model=${settings.model || 'default'}`);
       const proc = spawn(this.command, args, {
-        cwd: settings.workDir || opts.workDir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env },
+        ...spawnOpts(settings.workDir || opts.workDir),
       });
 
       setupAbort(proc, opts.signal);

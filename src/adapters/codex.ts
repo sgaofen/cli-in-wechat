@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { log } from '../utils/logger.js';
-import { commandExists, setupAbort, setupTimeout, stripAnsi } from './claude.js';
+import { commandExists, setupAbort, setupTimeout, stripAnsi, spawnOpts } from './claude.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
 
 export class CodexAdapter implements CLIAdapter {
@@ -58,7 +58,7 @@ export class CodexAdapter implements CLIAdapter {
 
       log.debug(`[codex] mode=${settings.mode} sandbox=${settings.sandbox || 'yolo'} search=${settings.search}`);
       const proc = spawn(this.command, args, {
-        cwd: opts.workDir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env },
+        ...spawnOpts(opts.workDir),
       });
 
       setupAbort(proc, opts.signal);

@@ -136,11 +136,7 @@ export class ClaudeAdapter implements CLIAdapter {
       if (sid) args.push('--resume', sid);
       if (opts.extraArgs) args.push(...opts.extraArgs);
 
-      const proc = spawn(this.command, args, {
-        cwd: settings.workDir || opts.workDir,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env },
-      });
+      const proc = spawn(this.command, args, spawnOpts(settings.workDir || opts.workDir) as any);
 
       setupAbort(proc, opts.signal);
       const timer = setupTimeout(proc, opts.timeout);
@@ -164,10 +160,17 @@ export class ClaudeAdapter implements CLIAdapter {
 }
 
 // ─── Shared helpers ────────────────────────────────────────
+const IS_WIN = process.platform === 'win32';
+
+/** Windows needs shell:true to find .cmd/.ps1 wrapper scripts */
+export function spawnOpts(cwd?: string): Record<string, unknown> {
+  return { cwd, stdio: ['ignore', 'pipe', 'pipe'] as const, env: { ...process.env }, shell: IS_WIN };
+}
+
 export function commandExists(cmd: string): Promise<boolean> {
-  const bin = process.platform === 'win32' ? 'where' : 'which';
+  const bin = IS_WIN ? 'where' : 'which';
   return new Promise((resolve) => {
-    const proc = spawn(bin, [cmd], { stdio: 'pipe', shell: process.platform === 'win32' });
+    const proc = spawn(bin, [cmd], { stdio: 'pipe', shell: IS_WIN });
     proc.on('close', (code) => resolve(code === 0));
     proc.on('error', () => resolve(false));
   });
