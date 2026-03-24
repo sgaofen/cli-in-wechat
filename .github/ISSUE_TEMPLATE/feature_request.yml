@@ -1,0 +1,26 @@
+name: Feature Request
+description: 功能建议 / Suggest a feature
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: 描述 / Description
+      placeholder: 你希望添加什么功能？
+    validations:
+      required: true
+  - type: dropdown
+    id: tool
+    attributes:
+      label: 相关工具 / Related tool
+      options:
+        - Claude Code
+        - Codex CLI
+        - Gemini CLI
+        - Kimi Code
+        - 新工具适配
+        - Bridge 核心功能
+  - type: textarea
+    id: extra
+    attributes:
+      label: 其他 / Additional context

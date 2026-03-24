@@ -1,0 +1,47 @@
+name: Bug Report
+description: 报告问题 / Report a bug
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: os
+    attributes:
+      label: 操作系统 / OS
+      options:
+        - Windows
+        - macOS
+        - Linux
+    validations:
+      required: true
+  - type: dropdown
+    id: tool
+    attributes:
+      label: 出问题的工具 / Which CLI tool
+      options:
+        - Claude Code
+        - Codex CLI
+        - Gemini CLI
+        - Kimi Code
+        - Aider
+        - Bridge 本身
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: 错误日志 / Error log
+      description: 微信收到的错误信息，或终端的日志输出
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤 / Steps to reproduce
+      placeholder: |
+        1. 发送 @claude 你好
+        2. 收到错误...
+  - type: textarea
+    id: extra
+    attributes:
+      label: 其他信息 / Additional context
+      placeholder: Node.js 版本、CLI 工具版本等
