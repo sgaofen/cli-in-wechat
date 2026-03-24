@@ -13,7 +13,7 @@ import type {
 const CHANNEL_VERSION = '1.0.2';
 const HTTP_TIMEOUT_MS = 45_000;
 
-export type MessageHandler = (msg: WeixinMessage, text: string) => void;
+export type MessageHandler = (msg: WeixinMessage, text: string, refText: string) => void;
 
 export class ILinkClient {
   private credentials: Credentials;
@@ -146,14 +146,14 @@ export class ILinkClient {
     this.contextTokens.set(msg.from_user_id, msg.context_token);
 
     log.debug(`[msg] item_list=${JSON.stringify(msg.item_list)}`);
-    const text = extractText(msg);
-    if (!text) return;
+    const { text, refText } = parseMessage(msg);
+    if (!text && !refText) return;
 
     log.debug(`收到 [${msg.from_user_id.substring(0, 12)}...]: ${text.substring(0, 60)}`);
 
     for (const handler of this.handlers) {
       try {
-        handler(msg, text);
+        handler(msg, text, refText);
       } catch (err) {
         log.error('消息处理器异常:', err);
       }
@@ -174,6 +174,7 @@ export class ILinkClient {
     }
 
     const chunks = chunkText(text, 2000);
+    log.debug(`发送给 [${userId.substring(0, 12)}...] (${chunks.length} 块): ${text.substring(0, 100)}${text.length > 100 ? '…' : ''}`);
     for (let i = 0; i < chunks.length; i++) {
       await this.sendRawMessage(userId, token, [
         { type: 1 as const, text_item: { text: chunks[i] } },
@@ -299,7 +300,7 @@ export class ILinkClient {
 
 // ─── Helpers ───────────────────────────────────────────────
 
-function extractText(msg: WeixinMessage): string {
+function parseMessage(msg: WeixinMessage): { text: string; refText: string } {
   const parts: string[] = [];
   let refText = '';
   for (const item of msg.item_list) {
@@ -315,13 +316,12 @@ function extractText(msg: WeixinMessage): string {
       if (refItem?.text_item?.text) refText = refItem.text_item.text;
       else if (refItem?.voice_item?.text) refText = refItem.voice_item.text;
       else if (ref.title) refText = ref.title;
-      log.debug(`[extractText] ref_msg title=${JSON.stringify(ref.title)} extracted=${JSON.stringify(refText.substring(0, 80))}`);
+      log.debug(`[parseMessage] ref_msg extracted=${JSON.stringify(refText.substring(0, 80))}`);
     }
   }
   // WeChat embeds quoted content inline as "[引用]:\n<content>" — strip the prefix
   const text = parts.join('\n').trim().replace(/^\[引用\]:\n?/, '');
-  if (refText && refText !== text) return text ? `${text}：${refText}` : refText;
-  return text;
+  return { text, refText };
 }
 
 function chunkText(text: string, maxLen: number): string[] {

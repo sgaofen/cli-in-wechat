@@ -9,6 +9,7 @@ import { KimiAdapter } from './kimi.js';
 export class AdapterRegistry {
   private adapters = new Map<string, CLIAdapter>();
   private available = new Set<string>();
+  private byDisplayName = new Map<string, string>(); // displayName → name
 
   constructor() {
     this.register(new ClaudeAdapter());
@@ -20,6 +21,11 @@ export class AdapterRegistry {
 
   private register(adapter: CLIAdapter): void {
     this.adapters.set(adapter.name, adapter);
+    this.byDisplayName.set(adapter.displayName, adapter.name);
+  }
+
+  getNameByDisplayName(displayName: string): string | undefined {
+    return this.byDisplayName.get(displayName);
   }
 
   async detectAvailable(): Promise<void> {
