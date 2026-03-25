@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { log } from '../utils/logger.js';
@@ -18,7 +18,7 @@ const TOOL_ALIASES: Record<string, string> = {
   codex: 'codex', cx: 'codex',
   gemini: 'gemini', gm: 'gemini',
   kimi: 'kimi', km: 'kimi',
-  aider: 'aider', ai: 'aider',
+  opencode: 'opencode', oc: 'opencode',
 };
 
 export class Router {
@@ -215,10 +215,10 @@ export class Router {
           '/yolo  auto+effort max',
           '/fast  effort low',
           '/reset  重置所有设置',
-          '/cc /cx /gm /km  切工具',
+          '/cc /cx /gm /km /oc  切工具',
           '',
           '— 发消息 —',
-          '@claude/@codex/@gemini/@kimi  指定工具',
+          '@claude/@codex/@gemini/@kimi/@opencode  指定工具',
           '>>  接力(传上条结果)',
           '@tool1>tool2  链式调用',
         ].join('\n'));
@@ -670,8 +670,8 @@ export class Router {
         this.sessions.update(uid, { defaultTool: 'gemini' }); await reply('→ gemini'); return true;
       case 'kimi': case 'km':
         this.sessions.update(uid, { defaultTool: 'kimi' }); await reply('→ kimi'); return true;
-      case 'aider': case 'ai':
-        this.sessions.update(uid, { defaultTool: 'aider' }); await reply('→ aider'); return true;
+      case 'opencode': case 'oc':
+        this.sessions.update(uid, { defaultTool: 'opencode' }); await reply('→ opencode'); return true;
 
       // ═══════════════════════════════════════════
       // 未识别
@@ -707,7 +707,7 @@ export class Router {
           const fullPath = join(dir, f);
           const id = f.replace('.jsonl', '');
           try {
-            const stat = require('fs').statSync(fullPath);
+            const stat = statSync(fullPath);
             const firstLines = readFileSync(fullPath, 'utf-8').split('\n').slice(0, 5);
             let summary = '(无摘要)';
             let date = stat.mtime.toISOString().slice(0, 16).replace('T', ' ');
@@ -752,7 +752,7 @@ export class Router {
             const files = readdirSync(dayDir).filter(f => f.endsWith('.jsonl'));
             for (const f of files) {
               try {
-                const stat = require('fs').statSync(join(dayDir, f));
+                const stat = statSync(join(dayDir, f));
                 const id = f.replace('.jsonl', '').replace('rollout-', '').substring(0, 40);
                 results.push({
                   id: 'last', // codex uses --last for resume

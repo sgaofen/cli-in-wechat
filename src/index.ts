@@ -16,7 +16,7 @@ async function main() {
     `
 ╔══════════════════════════════════════╗
 ║       cli-in-wechat  v0.1.0        ║
-║  Claude Code / Codex / Gemini CLI  ║
+║  Claude / Codex / Gemini / Kimi    ║
 ╚══════════════════════════════════════╝
 `,
   );

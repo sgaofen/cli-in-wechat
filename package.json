@@ -1,7 +1,7 @@
 {
   "name": "cli-in-wechat",
   "version": "0.1.0",
-  "description": "Run Claude Code, Codex, Gemini CLI in WeChat via iLink Bot API",
+  "description": "Run Claude Code, Codex, Gemini, Kimi, OpenCode in WeChat via iLink Bot API",
   "type": "module",
   "main": "dist/index.js",
   "bin": {

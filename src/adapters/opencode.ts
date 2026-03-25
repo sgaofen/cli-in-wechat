@@ -2,49 +2,33 @@ import { log } from '../utils/logger.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
 import { commandExists, spawnProc, setupAbort, setupTimeout, stripAnsi } from './base.js';
 
-export class AiderAdapter implements CLIAdapter {
-  readonly name = 'aider';
-  readonly displayName = 'Aider';
-  readonly command = 'aider';
+export class OpenCodeAdapter implements CLIAdapter {
+  readonly name = 'opencode';
+  readonly displayName = 'OpenCode';
+  readonly command = 'opencode';
   readonly capabilities: AdapterCapabilities = {
-    streaming: false,
-    jsonOutput: false,
-    sessionResume: false,
-    modes: ['auto', 'safe'],
-    hasEffort: false,
-    hasModel: true,
-    hasSearch: false,
-    hasBudget: false,
+    streaming: false, jsonOutput: true, sessionResume: false,
+    modes: ['auto'], hasEffort: false, hasModel: false, hasSearch: false, hasBudget: false,
   };
 
-  async isAvailable(): Promise<boolean> {
-    return commandExists(this.command);
-  }
+  async isAvailable(): Promise<boolean> { return commandExists(this.command); }
 
   execute(prompt: string, opts: ExecOptions): Promise<ExecResult> {
     return new Promise((resolve) => {
       const { settings } = opts;
-      const args = ['--no-pretty', '--no-stream', '--no-auto-commits'];
+      // opencode -p "prompt" auto-approves all permissions
+      const args = ['-p', prompt, '-f', 'json', '-q'];
 
-      switch (settings.mode) {
-        case 'auto':
-          args.push('--yes-always');
-          break;
-        case 'safe':
-        case 'plan':
-          args.push('--dry-run');
-          break;
+      if (settings.workDir || opts.workDir) {
+        args.push('-c', settings.workDir || opts.workDir!);
       }
 
-      if (settings.model) args.push('--model', settings.model);
-
-      args.push('-m', prompt);
       if (opts.extraArgs) args.push(...opts.extraArgs);
 
-      log.debug(`[aider] mode=${settings.mode}`);
+      log.debug(`[opencode] executing`);
 
       const proc = spawnProc(this.command, args, {
-        cwd: opts.workDir,
+        cwd: settings.workDir || opts.workDir,
         stdio: ['ignore', 'pipe', 'pipe'],
         env: { ...process.env },
       });
@@ -60,12 +44,19 @@ export class AiderAdapter implements CLIAdapter {
       proc.on('close', (code) => {
         if (timer) clearTimeout(timer);
         if (opts.signal?.aborted) { resolve({ text: '已取消', error: true }); return; }
-        resolve({ text: stripAnsi(stdout.trim() || stderr.trim()) || `exit ${code}`, error: code !== 0 });
+        try {
+          const r = JSON.parse(stdout);
+          resolve({
+            text: r.content || r.result || r.response || stdout.trim(),
+            error: !!r.error,
+          });
+        } catch {
+          resolve({ text: stripAnsi(stdout.trim() || stderr.trim()) || `exit ${code}`, error: code !== 0 });
+        }
       });
-
       proc.on('error', (err) => {
         if (timer) clearTimeout(timer);
-        resolve({ text: `无法启动 Aider: ${err.message}`, error: true });
+        resolve({ text: `无法启动 OpenCode: ${err.message}`, error: true });
       });
     });
   }
