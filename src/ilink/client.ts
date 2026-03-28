@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { generateWechatUin } from '../utils/crypto.js';
 import { log } from '../utils/logger.js';
-import { savePollCursor, loadPollCursor } from '../config.js';
+import { savePollCursor, loadPollCursor, saveContextTokens } from '../config.js';
 import type {
   Credentials,
   WeixinMessage,
@@ -144,6 +144,7 @@ export class ILinkClient {
 
     // Cache context_token for this user
     this.contextTokens.set(msg.from_user_id, msg.context_token);
+    saveContextTokens(this.contextTokens);
 
     log.debug(`[msg] item_list=${JSON.stringify(msg.item_list)}`);
     const { text, refText } = parseMessage(msg);

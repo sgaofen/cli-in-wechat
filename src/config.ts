@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import type { Credentials } from './ilink/types.js';
@@ -8,6 +8,7 @@ const CONFIG_FILE = join(DATA_DIR, 'config.json');
 const CREDENTIALS_FILE = join(DATA_DIR, 'credentials.json');
 const SESSIONS_DIR = join(DATA_DIR, 'sessions');
 const POLL_CURSOR_FILE = join(DATA_DIR, 'poll_cursor.txt');
+const CONTEXT_TOKENS_FILE = join(DATA_DIR, 'context_tokens.json');
 
 export interface ToolConfig {
   args?: string[];
@@ -89,6 +90,26 @@ export function loadPollCursor(): string {
 export function savePollCursor(cursor: string): void {
   ensureDataDir();
   writeFileSync(POLL_CURSOR_FILE, cursor, { mode: 0o600 });
+}
+
+export function saveContextTokens(tokens: Map<string, string>): void {
+  ensureDataDir();
+  const obj: Record<string, string> = {};
+  for (const [k, v] of tokens) obj[k] = v;
+  const tmp = CONTEXT_TOKENS_FILE + '.tmp';
+  writeFileSync(tmp, JSON.stringify(obj, null, 2), { mode: 0o600 });
+  renameSync(tmp, CONTEXT_TOKENS_FILE);
+}
+
+export function loadContextTokens(): Map<string, string> {
+  if (!existsSync(CONTEXT_TOKENS_FILE)) return new Map();
+  try {
+    const raw = readFileSync(CONTEXT_TOKENS_FILE, 'utf-8');
+    const obj = JSON.parse(raw) as Record<string, string>;
+    return new Map(Object.entries(obj));
+  } catch {
+    return new Map();
+  }
 }
 
 export function getSessionsDir(): string {

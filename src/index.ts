@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { login } from './ilink/auth.js';
 import { ILinkClient } from './ilink/client.js';
 import { AdapterRegistry } from './adapters/registry.js';
@@ -12,6 +13,13 @@ import {
 import { log, setLogLevel, LogLevel } from './utils/logger.js';
 
 async function main() {
+  const subcommand = process.argv[2];
+  if (subcommand === 'send') {
+    const { sendCommand } = await import('./cli/send.js');
+    await sendCommand(process.argv.slice(3));
+    process.exit(0);
+  }
+
   console.log(
     `
 ╔══════════════════════════════════════╗
