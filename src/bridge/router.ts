@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { execSync } from 'node:child_process';
 import { log } from '../utils/logger.js';
 import { ILinkClient } from '../ilink/client.js';
 import { AdapterRegistry } from '../adapters/registry.js';
@@ -689,7 +690,7 @@ export class Router {
     try {
       // Claude: ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
       // Codex: ~/.codex/sessions/YYYY/MM/DD/*.jsonl
-      // Gemini: different structure
+      // OpenCode: uses 'opencode session list --format json'
       let dir = '';
       if (tool === 'claude') {
         const encoded = workDir.replace(/[^a-zA-Z0-9]/g, '-');
@@ -697,6 +698,8 @@ export class Router {
       } else if (tool === 'codex') {
         dir = join(homedir(), '.codex', 'sessions');
         return this.listCodexSessions(dir);
+      } else if (tool === 'opencode') {
+        return this.listOpenCodeSessions(workDir);
       } else {
         return [];
       }
@@ -767,6 +770,28 @@ export class Router {
       }
       return results.sort((a, b) => b.mtime - a.mtime).slice(0, 10).map(({ id, date, summary }) => ({ id, date, summary }));
     } catch {
+      return [];
+    }
+  }
+
+  private listOpenCodeSessions(workDir: string): Array<{ id: string; date: string; summary: string }> {
+    try {
+      const stdout = execSync('opencode session list --format json -n 15', {
+        cwd: workDir,
+        encoding: 'utf-8',
+        timeout: 5000,
+      });
+      const sessions = JSON.parse(stdout);
+      return sessions.map((s: { id: string; title: string; updated: number }) => {
+        const date = new Date(s.updated).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }).replace(/\//g, '-');
+        return {
+          id: s.id,
+          date,
+          summary: s.title || '(无标题)',
+        };
+      });
+    } catch (err) {
+      log.debug(`[opencode] session list failed: ${(err as Error).message}`);
       return [];
     }
   }
