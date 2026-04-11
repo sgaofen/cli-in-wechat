@@ -7,8 +7,8 @@ export class OpenCodeAdapter implements CLIAdapter {
   readonly displayName = 'OpenCode';
   readonly command = 'opencode';
   readonly capabilities: AdapterCapabilities = {
-    streaming: false, jsonOutput: true, sessionResume: false,
-    modes: ['auto'], hasEffort: false, hasModel: false, hasSearch: false, hasBudget: false,
+    streaming: false, jsonOutput: true, sessionResume: true,
+    modes: ['auto', 'safe', 'plan'], hasEffort: false, hasModel: true, hasSearch: false, hasBudget: false,
   };
 
   async isAvailable(): Promise<boolean> { return commandExists(this.command); }
@@ -16,16 +16,28 @@ export class OpenCodeAdapter implements CLIAdapter {
   execute(prompt: string, opts: ExecOptions): Promise<ExecResult> {
     return new Promise((resolve) => {
       const { settings } = opts;
-      // opencode -p "prompt" auto-approves all permissions
-      const args = ['-p', prompt, '-f', 'json', '-q'];
+      const args = ['run', prompt, '--format', 'json', '--thinking'];
 
       if (settings.workDir || opts.workDir) {
-        args.push('-c', settings.workDir || opts.workDir!);
+        args.push('--dir', settings.workDir || opts.workDir!);
+      }
+
+      if (settings.mode === 'auto') {
+        args.push('--dangerously-skip-permissions');
+      }
+
+      if (settings.model) {
+        args.push('-m', settings.model);
+      }
+
+      const sid = settings.sessionIds[this.name];
+      if (sid) {
+        args.push('-s', sid);
       }
 
       if (opts.extraArgs) args.push(...opts.extraArgs);
 
-      log.debug(`[opencode] executing`);
+      log.debug(`[opencode] executing: run --format json --thinking`);
 
       const proc = spawnProc(this.command, args, {
         cwd: settings.workDir || opts.workDir,
@@ -44,12 +56,40 @@ export class OpenCodeAdapter implements CLIAdapter {
       proc.on('close', (code) => {
         if (timer) clearTimeout(timer);
         if (opts.signal?.aborted) { resolve({ text: '已取消', error: true }); return; }
+
         try {
-          const r = JSON.parse(stdout);
-          resolve({
-            text: r.content || r.result || r.response || stdout.trim(),
-            error: !!r.error,
-          });
+          let text = '';
+          let thinking = '';
+          let sessionId: string | undefined;
+          let hasError = code !== 0;
+
+          const lines = stdout.trim().split('\n');
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const obj = JSON.parse(line);
+              if (obj.type === 'text' && obj.part?.text) {
+                text += obj.part.text;
+              }
+              if (obj.type === 'reasoning' && obj.part?.text) {
+                thinking += obj.part.text;
+              }
+              if (obj.sessionID && !sessionId) {
+                sessionId = obj.sessionID;
+              }
+              if (obj.type === 'step_finish' && obj.part?.reason === 'error') {
+                hasError = true;
+              }
+            } catch {
+              // ignore parse errors for individual lines
+            }
+          }
+
+          if (text) {
+            resolve({ text, thinking: thinking || undefined, sessionId, error: hasError });
+          } else {
+            resolve({ text: stripAnsi(stdout.trim() || stderr.trim()) || `exit ${code}`, error: code !== 0 });
+          }
         } catch {
           resolve({ text: stripAnsi(stdout.trim() || stderr.trim()) || `exit ${code}`, error: code !== 0 });
         }

@@ -193,6 +193,7 @@ export class Router {
           '/include <目录>  上下文(Gemini)',
           '/ext <名>  扩展(Gemini)',
           '/thinking  深度思考(Kimi)',
+          '/thoughts  显示AI思考内容',
           '',
           '— 操作 —',
           '/diff  查看git差异',
@@ -403,6 +404,13 @@ export class Router {
       case 'thinking': {
         this.sessions.update(uid, { thinking: !settings.thinking });
         await reply(`thinking → ${!settings.thinking ? 'ON (深度思考)' : 'OFF'}`);
+        return true;
+      }
+
+      case 'thoughts': {
+        const newValue = !settings.showThoughts;
+        this.sessions.update(uid, { showThoughts: newValue });
+        await reply(`thoughts → ${newValue ? '已开启 (将显示AI思考)' : '已关闭'}`);
         return true;
       }
 
@@ -925,6 +933,7 @@ export class Router {
     this.active.set(`${uid}:${toolName}`, { abort, tool: toolName });
     const stopTyping = await this.ilink.startTyping(uid);
     const start = Date.now();
+    const settings = this.sessions.get(uid);
 
     try {
       const { result, notice } = await this.runOnce(toolName, uid, prompt, abort.signal);
@@ -938,6 +947,11 @@ export class Router {
       // Store for >> relay; auto-switch defaultTool to last used tool
       this.lastResponse.set(uid, { tool: adapter.displayName, text: result.text });
       this.sessions.update(uid, { defaultTool: toolName });
+
+      // Send thinking content first if enabled
+      if (settings.showThoughts && result.thinking) {
+        await this.ilink.sendText(uid, `THINKING:\n\n${result.thinking}\n\n---`);
+      }
 
       await this.ilink.sendText(uid, formatResponse(notice + result.text, {
         tool: adapter.displayName,
