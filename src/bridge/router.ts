@@ -710,17 +710,22 @@ export class Router {
             const stat = statSync(fullPath);
             const firstLines = readFileSync(fullPath, 'utf-8').split('\n').slice(0, 5);
             let summary = '(无摘要)';
-            let date = stat.mtime.toISOString().slice(0, 16).replace('T', ' ');
+            let date = stat.mtime.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }).replace(/\//g, '-');
             for (const line of firstLines) {
               if (!line.trim()) continue;
               try {
                 const obj = JSON.parse(line);
                 if (obj.type === 'user' && obj.message?.content) {
-                  const content = typeof obj.message.content === 'string'
+                  let content = typeof obj.message.content === 'string'
                     ? obj.message.content
                     : obj.message.content.map((b: { text?: string }) => b.text || '').join('');
+                  // 移除系统注入的提示
+                  content = content.replace(/\n\n\[提示:.*?\]$/, '');
                   summary = content.substring(0, 60) + (content.length > 60 ? '...' : '');
-                  if (obj.timestamp) date = obj.timestamp.slice(0, 16).replace('T', ' ');
+                  if (obj.timestamp) {
+                    const ts = new Date(obj.timestamp);
+                    date = ts.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }).replace(/\//g, '-');
+                  }
                   break;
                 }
               } catch { continue; }
