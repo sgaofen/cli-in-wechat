@@ -1,6 +1,34 @@
 import { log } from '../utils/logger.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
 import { commandExists, spawnProc, setupAbort, setupTimeout, isSessionError } from './base.js';
+import type { DownloadedMedia } from '../utils/media.js';
+import { copyMediaToWorkDir } from '../utils/media.js';
+
+function buildMediaPrompt(prompt: string, media?: DownloadedMedia[], workDir?: string): string {
+  if (!media || media.length === 0) return prompt;
+  
+  // 复制文件到工作目录
+  const copiedMedia = workDir ? media.map(m => copyMediaToWorkDir(m, workDir)) : media;
+  
+  const fileList = copiedMedia.map(m => {
+    const relativePath = workDir && m.path.startsWith(workDir) 
+      ? m.path.slice(workDir.length).replace(/^[\/\\]/, '')
+      : m.path;
+    const typeNames: Record<string, string> = { image: '图片', file: '文件', video: '视频' };
+    const sizeStr = m.size ? `${(m.size / 1024).toFixed(1)}KB` : '未知大小';
+    return `- ${m.fileName}\n  类型: ${typeNames[m.type] || '文件'}\n  大小: ${sizeStr}\n  路径: ${relativePath}`;
+  }).join('\n\n');
+  
+  const userPrompt = prompt.trim() && !prompt.startsWith('[文件:') && !prompt.startsWith('[图片:') && !prompt.startsWith('[视频:')
+    ? `\n\n用户说：${prompt}`
+    : '';
+  
+  return `已接收到用户通过微信发送的文件：
+
+${fileList}
+
+文件已保存到工作目录，等待您的指令。${userPrompt}`;
+}
 
 export class ClaudeAdapter implements CLIAdapter {
   readonly name = 'claude';
@@ -15,13 +43,20 @@ export class ClaudeAdapter implements CLIAdapter {
 
   async execute(prompt: string, opts: ExecOptions): Promise<ExecResult> {
     const { settings } = opts;
+    const workDir = settings.workDir || opts.workDir;
+    const fullPrompt = buildMediaPrompt(prompt, opts.media, workDir);
+    
+    log.debug(`[claude] workDir: ${workDir}`);
+    if (opts.media && opts.media.length > 0) {
+      log.debug(`[claude] media paths: ${opts.media.map(m => m.path).join(', ')}`);
+    }
 
     // Try Agent SDK for full interactive support (AskUserQuestion)
     try {
-      return await this.executeWithSDK(prompt, opts);
+      return await this.executeWithSDK(fullPrompt, opts);
     } catch (sdkErr) {
       log.warn(`[claude] Agent SDK failed, falling back to CLI: ${(sdkErr as Error).message}`);
-      return this.executeWithCLI(prompt, opts);
+      return this.executeWithCLI(fullPrompt, opts);
     }
   }
 
@@ -131,8 +166,9 @@ export class ClaudeAdapter implements CLIAdapter {
   private executeWithCLI(prompt: string, opts: ExecOptions): Promise<ExecResult> {
     return new Promise((resolve) => {
       const { settings } = opts;
-      // --verbose is required by Claude CLI when using stream-json in -p mode.
-      const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose'];
+      // Prompt is passed via stdin below to avoid Windows cmd.exe issues with
+      // special characters. --verbose is required for stream-json in -p mode.
+      const args = ['-p', '--output-format', 'stream-json', '--verbose'];
       if (settings.showThoughts) args.push('--thinking', 'enabled');
 
       switch (settings.mode) {
@@ -154,11 +190,17 @@ export class ClaudeAdapter implements CLIAdapter {
       if (opts.extraArgs) args.push(...opts.extraArgs);
 
       log.debug(`[claude] effort=${settings.effort} model=${settings.model || 'default'} mode=${settings.mode}`);
+      log.debug(`[claude] stdin prompt length: ${prompt.length}`);
+      
       const proc = spawnProc(this.command, args, {
         cwd: settings.workDir || opts.workDir,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env },
       });
+
+      // 通过 stdin 传递提示词
+      proc.stdin!.write(prompt, 'utf8');
+      proc.stdin!.end();
 
       setupAbort(proc, opts.signal);
       const timer = setupTimeout(proc, opts.timeout);

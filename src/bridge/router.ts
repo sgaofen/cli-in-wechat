@@ -10,6 +10,7 @@ import { formatResponse } from './formatter.js';
 import type { WeixinMessage } from '../ilink/types.js';
 import type { BridgeConfig } from '../config.js';
 import type { AskUserRequest } from '../adapters/base.js';
+import type { DownloadedMedia } from '../utils/media.js';
 
 interface ActiveTask { abort: AbortController; tool: string }
 interface PendingQuestion { resolve: (answer: string) => void; timeout: ReturnType<typeof setTimeout>; toolName: string }
@@ -40,8 +41,8 @@ export class Router {
   }
 
   start(): void {
-    this.ilink.onMessage((msg, text, refText) => {
-      this.handle(msg, text, refText).catch((e) => log.error('路由异常:', e));
+    this.ilink.onMessage((msg, text, refText, media) => {
+      this.handle(msg, text, refText, media).catch((e) => log.error('路由异常:', e));
     });
   }
 
@@ -67,11 +68,21 @@ export class Router {
   }
 
 
-  private async handle(msg: WeixinMessage, text: string, refText: string): Promise<void> {
+  private async handle(msg: WeixinMessage, text: string, refText: string, media?: DownloadedMedia[]): Promise<void> {
     const uid = msg.from_user_id;
     if (this.config.allowedUsers.length > 0 && !this.config.allowedUsers.includes(uid)) return;
 
     const trimmed = text.trim();
+
+    // Build media context for CLI
+    let mediaContext = '';
+    if (media && media.length > 0) {
+      const mediaInfo = media.map(m => {
+        const typeNames: Record<string, string> = { image: '图片', file: '文件', video: '视频' };
+        return `${typeNames[m.type] || '媒体'}: ${m.fileName} (${m.path})`;
+      });
+      mediaContext = `\n\n[收到媒体文件]\n${mediaInfo.join('\n')}`;
+    }
 
     // ── /command ──
     if (trimmed.startsWith('/')) {
@@ -90,7 +101,7 @@ export class Router {
       if (t1 && t2 && this.registry.isAvailable(t1) && this.registry.isAvailable(t2)) {
         const busy = [t1, t2].find(t => this.active.has(`${uid}:${t}`));
         if (busy) { await this.ilink.sendText(uid, `${busy} 在忙`); return; }
-        await this.chain(uid, t1, t2, prompt);
+        await this.chain(uid, t1, t2, prompt + mediaContext, media);
         return;
       }
     }
@@ -108,8 +119,8 @@ export class Router {
       const toolName = this.getCli(uid, rest, refText);
       this.sessions.update(uid, { defaultTool: toolName });
       if (this.active.has(`${uid}:${toolName}`)) { await this.ilink.sendText(uid, `${toolName} 在忙`); return; }
-      const fullPrompt = `以下是 ${prev.tool} 的输出:\n\n${prev.text}\n\n---\n\n${prompt}`;
-      await this.exec(uid, toolName, fullPrompt);
+      const fullPrompt = `以下是 ${prev.tool} 的输出:\n\n${prev.text}\n\n---\n\n${prompt}${mediaContext}`;
+      await this.exec(uid, toolName, fullPrompt, media);
       return;
     }
 
@@ -149,8 +160,8 @@ export class Router {
     if (this.active.has(`${uid}:${toolName}`)) { await this.ilink.sendText(uid, `${toolName} 在忙`); return; }
 
     const prompt = atMatch ? atMatch[2].trim() : trimmed;
-    const combined = [prompt, refText].filter(Boolean).join('\n\n');
-    await this.exec(uid, toolName, combined);
+    const combined = [prompt, refText].filter(Boolean).join('\n\n') + mediaContext;
+    await this.exec(uid, toolName, combined, media);
   }
 
   // ─── /command → ALL are commands, never pass through ────
@@ -205,6 +216,7 @@ export class Router {
           '/files  列出目录结构',
           '/compact  压缩上下文(清session)',
           '/stats  使用统计',
+          '/send <文件路径>  发送文件到微信',
           '',
           '— 会话 —',
           '/new  新会话',
@@ -564,6 +576,35 @@ export class Router {
         return true;
       }
 
+      case 'send': {
+        if (!arg) {
+          await reply('/send <文件路径>\n发送本地文件到微信');
+          return true;
+        }
+        try {
+          const filePath = arg.trim();
+          const { existsSync } = await import('node:fs');
+          if (!existsSync(filePath)) {
+            await reply(`文件不存在: ${filePath}`);
+            return true;
+          }
+          const ext = filePath.split('.').pop()?.toLowerCase();
+          if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(ext || '')) {
+            await this.ilink.sendImage(uid, filePath);
+            await reply(`已发送图片: ${filePath}`);
+          } else if (['mp4', 'mov', 'avi', 'mkv', 'webm'].includes(ext || '')) {
+            await this.ilink.sendVideo(uid, filePath);
+            await reply(`已发送视频: ${filePath}`);
+          } else {
+            await this.ilink.sendFile(uid, filePath);
+            await reply(`已发送文件: ${filePath}`);
+          }
+        } catch (err) {
+          await reply(`发送失败: ${(err as Error).message}`);
+        }
+        return true;
+      }
+
       case 'plan': {
         if (arg) {
           // /plan <description> → send plan request to tool
@@ -811,7 +852,7 @@ export class Router {
 
   // ─── Chain: tool1 → tool2 ─────────────────────────────
 
-  private async chain(uid: string, tool1: string, tool2: string, prompt: string): Promise<void> {
+  private async chain(uid: string, tool1: string, tool2: string, prompt: string, media?: DownloadedMedia[]): Promise<void> {
     const adapter1 = this.registry.get(tool1);
     const adapter2 = this.registry.get(tool2);
     if (!adapter1 || !adapter2) return;
@@ -825,7 +866,7 @@ export class Router {
     try {
       // Step 1: run tool1
       log.debug(`[chain] step1: ${tool1}`);
-      const { result: r1, notice: n1 } = await this.runOnce(tool1, uid, prompt, abort.signal);
+      const { result: r1, notice: n1 } = await this.runOnce(tool1, uid, prompt, abort.signal, media);
 
       if (abort.signal.aborted || r1.error) {
         if (!abort.signal.aborted) {
@@ -881,15 +922,22 @@ export class Router {
     uid: string,
     prompt: string,
     signal: AbortSignal,
+    media?: DownloadedMedia[],
   ): Promise<{ result: import('../adapters/base.js').ExecResult; notice: string }> {
     const adapter = this.registry.get(toolName)!;
     const extraArgs = this.config.tools[toolName]?.args;
     const hadSession = adapter.capabilities.sessionResume && !!this.sessions.get(uid).sessionIds[toolName];
 
     if (signal.aborted) return { result: { text: '已取消', error: true }, notice: '' };
-    const result = await adapter.execute(prompt, {
+    
+    // 追加 SEND_FILE 提示到 prompt
+    const sendFileHint = '\n\n[提示: 如果需要发送文件/图片到微信，在响应中包含标记 [SEND_FILE: 文件路径]]';
+    const enhancedPrompt = prompt + sendFileHint;
+    
+    const result = await adapter.execute(enhancedPrompt, {
       settings: this.sessions.get(uid), workDir: this.config.workDir, timeout: this.config.cliTimeout, extraArgs, signal,
       askUser: (req) => this.askUserViaWeChat(uid, toolName, req),
+      media,
     });
 
     if (result.sessionExpired && hadSession && !signal.aborted) {
@@ -955,7 +1003,7 @@ export class Router {
     return answers;
   }
 
-  private async exec(uid: string, toolName: string, prompt: string): Promise<void> {
+  private async exec(uid: string, toolName: string, prompt: string, media?: DownloadedMedia[]): Promise<void> {
     const adapter = this.registry.get(toolName);
     if (!adapter) return;
 
@@ -966,7 +1014,7 @@ export class Router {
     const settings = this.sessions.get(uid);
 
     try {
-      const { result, notice } = await this.runOnce(toolName, uid, prompt, abort.signal);
+      const { result, notice } = await this.runOnce(toolName, uid, prompt, abort.signal, media);
 
       if (abort.signal.aborted) return;
 
@@ -974,8 +1022,11 @@ export class Router {
         this.sessions.setSession(uid, toolName, result.sessionId);
       }
 
+      // Parse [SEND_FILE: path] markers and send files
+      const { text: cleanText, sentFiles } = await this.parseAndSendFiles(uid, result.text);
+
       // Store for >> relay; auto-switch defaultTool to last used tool
-      this.lastResponse.set(uid, { tool: adapter.displayName, text: result.text });
+      this.lastResponse.set(uid, { tool: adapter.displayName, text: cleanText });
       this.sessions.update(uid, { defaultTool: toolName });
 
       // Send thinking content first if enabled
@@ -983,7 +1034,11 @@ export class Router {
         await this.ilink.sendText(uid, `思考过程：\n\n${result.thinking}\n\n———`);
       }
 
-      await this.ilink.sendText(uid, formatResponse(notice + result.text, {
+      const sentNotice = sentFiles.length > 0
+        ? `\n[已发送文件: ${sentFiles.join(', ')}]`
+        : '';
+
+      await this.ilink.sendText(uid, formatResponse(notice + cleanText + sentNotice, {
         tool: adapter.displayName,
         duration: result.duration || (Date.now() - start),
         error: result.error,
@@ -997,5 +1052,46 @@ export class Router {
       stopTyping();
       this.active.delete(`${uid}:${toolName}`);
     }
+  }
+
+  private async parseAndSendFiles(uid: string, text: string): Promise<{ text: string; sentFiles: string[] }> {
+    const { existsSync } = await import('node:fs');
+    const sentFiles: string[] = [];
+    const regex = /\[SEND_FILE:\s*([^\]]+)\]/g;
+    let match;
+    const workDir = this.sessions.get(uid).workDir || this.config.workDir;
+
+    while ((match = regex.exec(text)) !== null) {
+      let filePath = match[1].trim();
+      
+      // 处理相对路径
+      if (!filePath.match(/^[A-Za-z]:/) && !filePath.startsWith('/')) {
+        filePath = join(workDir, filePath);
+      }
+
+      try {
+        if (!existsSync(filePath)) {
+          log.warn(`[SEND_FILE] 文件不存在: ${filePath}`);
+          continue;
+        }
+
+        const ext = filePath.split('.').pop()?.toLowerCase();
+        if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(ext || '')) {
+          await this.ilink.sendImage(uid, filePath);
+        } else if (['mp4', 'mov', 'avi', 'mkv', 'webm'].includes(ext || '')) {
+          await this.ilink.sendVideo(uid, filePath);
+        } else {
+          await this.ilink.sendFile(uid, filePath);
+        }
+        sentFiles.push(filePath.split(/[\\/]/).pop() || filePath);
+        log.info(`[SEND_FILE] 已发送: ${filePath}`);
+      } catch (err) {
+        log.error(`[SEND_FILE] 发送失败: ${filePath}`, err);
+      }
+    }
+
+    // 移除标记
+    const cleanText = text.replace(regex, '').trim();
+    return { text: cleanText, sentFiles };
   }
 }

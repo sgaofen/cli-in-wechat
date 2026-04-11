@@ -1,6 +1,33 @@
 import { log } from '../utils/logger.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
 import { commandExists, spawnProc, setupAbort, setupTimeout, stripAnsi } from './base.js';
+import type { DownloadedMedia } from '../utils/media.js';
+import { copyMediaToWorkDir } from '../utils/media.js';
+
+function buildMediaPrompt(prompt: string, media?: DownloadedMedia[], workDir?: string): string {
+  if (!media || media.length === 0) return prompt;
+  
+  const copiedMedia = workDir ? media.map(m => copyMediaToWorkDir(m, workDir)) : media;
+  
+  const fileList = copiedMedia.map(m => {
+    const relativePath = workDir && m.path.startsWith(workDir) 
+      ? m.path.slice(workDir.length).replace(/^[\/\\]/, '')
+      : m.path;
+    const typeNames: Record<string, string> = { image: '图片', file: '文件', video: '视频' };
+    const sizeStr = m.size ? `${(m.size / 1024).toFixed(1)}KB` : '未知大小';
+    return `- ${m.fileName}\n  类型: ${typeNames[m.type] || '文件'}\n  大小: ${sizeStr}\n  路径: ${relativePath}`;
+  }).join('\n\n');
+  
+  const userPrompt = prompt.trim() && !prompt.startsWith('[文件:') && !prompt.startsWith('[图片:') && !prompt.startsWith('[视频:')
+    ? `\n\n用户说：${prompt}`
+    : '';
+  
+  return `已接收到用户通过微信发送的文件：
+
+${fileList}
+
+文件已保存到工作目录，等待您的指令。${userPrompt}`;
+}
 
 export class OpenCodeAdapter implements CLIAdapter {
   readonly name = 'opencode';
@@ -16,7 +43,12 @@ export class OpenCodeAdapter implements CLIAdapter {
   execute(prompt: string, opts: ExecOptions): Promise<ExecResult> {
     return new Promise((resolve) => {
       const { settings } = opts;
-      const args = ['run', prompt, '--format', 'json'];
+      const workDir = settings.workDir || opts.workDir;
+      const fullPrompt = buildMediaPrompt(prompt, opts.media, workDir);
+      // Prompt is passed via stdin below. PR #11 comment thread noted that
+      // buildMediaPrompt injects newlines / special chars that break positional
+      // arg passing on Windows cmd.exe with shell:true. stdin side-steps that.
+      const args = ['run', '--format', 'json'];
       if (settings.showThoughts) args.push('--thinking');
 
       if (settings.workDir || opts.workDir) {
@@ -42,9 +74,12 @@ export class OpenCodeAdapter implements CLIAdapter {
 
       const proc = spawnProc(this.command, args, {
         cwd: settings.workDir || opts.workDir,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env },
       });
+
+      proc.stdin!.write(fullPrompt, 'utf8');
+      proc.stdin!.end();
 
       setupAbort(proc, opts.signal);
       const timer = setupTimeout(proc, opts.timeout);

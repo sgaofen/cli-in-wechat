@@ -1,7 +1,10 @@
-import { randomUUID } from 'node:crypto';
-import { generateWechatUin } from '../utils/crypto.js';
+import { randomUUID, randomBytes } from 'node:crypto';
+import { readFileSync, existsSync, statSync } from 'node:fs';
+import { basename } from 'node:path';
+import { generateWechatUin, encryptAesEcb, aesEcbPaddedSize, encodeMessageAesKey, md5 } from '../utils/crypto.js';
 import { log } from '../utils/logger.js';
 import { savePollCursor, loadPollCursor, saveContextTokens } from '../config.js';
+import { downloadImage, downloadFile, downloadVideo, type DownloadedMedia } from '../utils/media.js';
 import type {
   Credentials,
   WeixinMessage,
@@ -12,8 +15,19 @@ import type {
 
 const CHANNEL_VERSION = '1.0.2';
 const HTTP_TIMEOUT_MS = 45_000;
+const CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
 
-export type MessageHandler = (msg: WeixinMessage, text: string, refText: string) => void;
+// Upload media types
+const UPLOAD_MEDIA_TYPE_IMAGE = 1;
+const UPLOAD_MEDIA_TYPE_VIDEO = 2;
+const UPLOAD_MEDIA_TYPE_FILE = 3;
+
+export type MessageHandler = (
+  msg: WeixinMessage,
+  text: string,
+  refText: string,
+  media?: DownloadedMedia[]
+) => void;
 
 export class ILinkClient {
   private credentials: Credentials;
@@ -70,7 +84,7 @@ export class ILinkClient {
         this.backoffMs = 1000;
 
         for (const msg of msgs) {
-          this.processMessage(msg);
+          await this.processMessage(msg);
         }
       } catch (err: unknown) {
         if (!this.running) return;
@@ -138,7 +152,7 @@ export class ILinkClient {
 
   // ─── Message handling ──────────────────────────────────
 
-  private processMessage(msg: WeixinMessage): void {
+  private async processMessage(msg: WeixinMessage): Promise<void> {
     // Only process user messages, skip bot echoes
     if (msg.message_type !== 1) return;
 
@@ -147,14 +161,14 @@ export class ILinkClient {
     saveContextTokens(this.contextTokens);
 
     log.debug(`[msg] item_list=${JSON.stringify(msg.item_list)}`);
-    const { text, refText } = parseMessage(msg);
-    if (!text && !refText) return;
+    const { text, refText, mediaItems } = await parseMessage(msg);
+    if (!text && !refText && mediaItems.length === 0) return;
 
-    log.debug(`收到 [${msg.from_user_id.substring(0, 12)}...]: ${text.substring(0, 60)}`);
+    log.debug(`收到 [${msg.from_user_id.substring(0, 12)}...]: ${text.substring(0, 60)}${mediaItems.length > 0 ? ` (+${mediaItems.length} media)` : ''}`);
 
     for (const handler of this.handlers) {
       try {
-        handler(msg, text, refText);
+        handler(msg, text, refText, mediaItems.length > 0 ? mediaItems : undefined);
       } catch (err) {
         log.error('消息处理器异常:', err);
       }
@@ -220,6 +234,175 @@ export class ILinkClient {
     if (data.ret !== undefined && data.ret !== 0) {
       throw new Error(`发送消息失败: ${data.errmsg || `ret=${data.ret}`}`);
     }
+  }
+
+  // ─── File/Image/Video Upload & Send ──────────────────────
+
+  async sendFile(userId: string, filePath: string, title?: string): Promise<void> {
+    const token = this.contextTokens.get(userId);
+    if (!token) {
+      log.error(`无法发送文件给 ${userId}: 缺少 context_token`);
+      return;
+    }
+
+    if (!existsSync(filePath)) {
+      throw new Error(`文件不存在: ${filePath}`);
+    }
+
+    const upload = await this.uploadToCdn(userId, filePath, UPLOAD_MEDIA_TYPE_FILE);
+    const fileName = title || basename(filePath);
+
+    await this.sendRawMessage(userId, token, [
+      {
+        type: 4,
+        file_item: {
+          file_name: fileName,
+          len: String(upload.rawsize),
+          media: {
+            encrypt_query_param: upload.downloadParam,
+            aes_key: encodeMessageAesKey(upload.aeskey),
+            encrypt_type: 1,
+          },
+        },
+      },
+    ]);
+
+    log.info(`[sendFile] 已发送: ${fileName}`);
+  }
+
+  async sendImage(userId: string, imagePath: string, caption?: string): Promise<void> {
+    const token = this.contextTokens.get(userId);
+    if (!token) {
+      log.error(`无法发送图片给 ${userId}: 缺少 context_token`);
+      return;
+    }
+
+    if (!existsSync(imagePath)) {
+      throw new Error(`图片不存在: ${imagePath}`);
+    }
+
+    if (caption) {
+      await this.sendText(userId, caption);
+    }
+
+    const upload = await this.uploadToCdn(userId, imagePath, UPLOAD_MEDIA_TYPE_IMAGE);
+
+    await this.sendRawMessage(userId, token, [
+      {
+        type: 2,
+        image_item: {
+          media: {
+            encrypt_query_param: upload.downloadParam,
+            aes_key: encodeMessageAesKey(upload.aeskey),
+            encrypt_type: 1,
+          },
+          mid_size: upload.filesize,
+        },
+      },
+    ]);
+
+    log.info(`[sendImage] 已发送图片: ${basename(imagePath)}`);
+  }
+
+  async sendVideo(userId: string, videoPath: string): Promise<void> {
+    const token = this.contextTokens.get(userId);
+    if (!token) {
+      log.error(`无法发送视频给 ${userId}: 缺少 context_token`);
+      return;
+    }
+
+    if (!existsSync(videoPath)) {
+      throw new Error(`视频不存在: ${videoPath}`);
+    }
+
+    const upload = await this.uploadToCdn(userId, videoPath, UPLOAD_MEDIA_TYPE_VIDEO);
+
+    await this.sendRawMessage(userId, token, [
+      {
+        type: 5,
+        video_item: {
+          media: {
+            encrypt_query_param: upload.downloadParam,
+            aes_key: encodeMessageAesKey(upload.aeskey),
+            encrypt_type: 1,
+          },
+          video_size: upload.filesize,
+        },
+      },
+    ]);
+
+    log.info(`[sendVideo] 已发送视频: ${basename(videoPath)}`);
+  }
+
+  private async uploadToCdn(
+    userId: string,
+    filePath: string,
+    mediaType: number,
+  ): Promise<{ rawsize: number; filesize: number; aeskey: Buffer; downloadParam: string }> {
+    const plaintext = readFileSync(filePath);
+    const rawsize = plaintext.length;
+    const rawfilemd5 = md5(plaintext);
+    const filesize = aesEcbPaddedSize(rawsize);
+
+    const filekey = randomBytes(16).toString('hex');
+    const aeskey = randomBytes(16);
+
+    // Get upload URL from iLink
+    const uploadResp = await fetch(
+      `${this.credentials.baseUrl}/ilink/bot/getuploadurl`,
+      {
+        method: 'POST',
+        headers: this.headers(),
+        body: JSON.stringify({
+          filekey,
+          media_type: mediaType,
+          to_user_id: userId,
+          rawsize,
+          rawfilemd5,
+          filesize,
+          aeskey: aeskey.toString('hex'),
+          no_need_thumb: true,
+          base_info: this.baseInfo(),
+        }),
+      },
+    );
+
+    if (!uploadResp.ok) {
+      const body = await uploadResp.text().catch(() => '');
+      throw new Error(`获取上传URL失败: HTTP ${uploadResp.status} ${body}`);
+    }
+
+    const uploadData = (await uploadResp.json()) as { upload_param?: string };
+    const uploadParam = uploadData.upload_param;
+    if (!uploadParam) {
+      throw new Error('获取上传URL失败: 无 upload_param');
+    }
+
+    // Encrypt and upload to CDN
+    const ciphertext = encryptAesEcb(plaintext, aeskey);
+    const cdnUrl = `${CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(uploadParam)}&filekey=${encodeURIComponent(filekey)}`;
+
+    log.debug(`[upload] Uploading to CDN: ${rawsize} bytes`);
+
+    const cdnResp = await fetch(cdnUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: new Uint8Array(ciphertext),
+    });
+
+    if (!cdnResp.ok) {
+      const body = await cdnResp.text().catch(() => '');
+      throw new Error(`CDN 上传失败: HTTP ${cdnResp.status} ${body}`);
+    }
+
+    const downloadParam = cdnResp.headers.get('x-encrypted-param');
+    if (!downloadParam) {
+      throw new Error('CDN 上传失败: 无 x-encrypted-param');
+    }
+
+    log.debug(`[upload] CDN upload success, downloadParam: ${downloadParam.substring(0, 30)}...`);
+
+    return { rawsize, filesize, aeskey, downloadParam };
   }
 
   // ─── Typing indicator ─────────────────────────────────
@@ -301,14 +484,43 @@ export class ILinkClient {
 
 // ─── Helpers ───────────────────────────────────────────────
 
-function parseMessage(msg: WeixinMessage): { text: string; refText: string } {
+async function parseMessage(msg: WeixinMessage): Promise<{ text: string; refText: string; mediaItems: DownloadedMedia[] }> {
   const parts: string[] = [];
   let refText = '';
+  const mediaItems: DownloadedMedia[] = [];
+  
   for (const item of msg.item_list) {
     if (item.type === 1 && item.text_item?.text) {
       parts.push(item.text_item.text);
+    } else if (item.type === 2 && item.image_item) {
+      try {
+        const media = await downloadImage(item.image_item);
+        mediaItems.push(media);
+        parts.push(`[图片: ${media.fileName}]`);
+      } catch (err) {
+        log.error('[parseMessage] 下载图片失败:', err);
+        parts.push('[图片: 下载失败]');
+      }
     } else if (item.type === 3 && item.voice_item?.text) {
       parts.push(item.voice_item.text); // voice-to-text transcription
+    } else if (item.type === 4 && item.file_item) {
+      try {
+        const media = await downloadFile(item.file_item);
+        mediaItems.push(media);
+        parts.push(`[文件: ${media.fileName}]`);
+      } catch (err) {
+        log.error('[parseMessage] 下载文件失败:', err);
+        parts.push('[文件: 下载失败]');
+      }
+    } else if (item.type === 5 && item.video_item) {
+      try {
+        const media = await downloadVideo(item.video_item);
+        mediaItems.push(media);
+        parts.push(`[视频: ${media.fileName}]`);
+      } catch (err) {
+        log.error('[parseMessage] 下载视频失败:', err);
+        parts.push('[视频: 下载失败]');
+      }
     }
     // Extract quoted message content (WeChat 引用消息)
     const ref = item.ref_msg;
@@ -322,7 +534,7 @@ function parseMessage(msg: WeixinMessage): { text: string; refText: string } {
   }
   // WeChat embeds quoted content inline as "[引用]:\n<content>" — strip the prefix
   const text = parts.join('\n').trim().replace(/^\[引用\]:\n?/, '');
-  return { text, refText };
+  return { text, refText, mediaItems };
 }
 
 function chunkText(text: string, maxLen: number): string[] {

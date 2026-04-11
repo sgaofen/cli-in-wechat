@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { log } from '../utils/logger.js';
+import type { DownloadedMedia } from '../utils/media.js';
 
 export type ToolMode = 'auto' | 'safe' | 'plan';
 
@@ -83,6 +84,7 @@ export interface ExecOptions {
   extraArgs?: string[];
   signal?: AbortSignal;
   askUser?: (req: AskUserRequest) => Promise<Record<string, string>>;
+  media?: DownloadedMedia[];
 }
 
 export interface ExecResult {
