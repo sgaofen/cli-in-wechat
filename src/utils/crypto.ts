@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'node:crypto';
 
 export function encryptAesEcb(plaintext: Buffer, key: Buffer): Buffer {
   const cipher = createCipheriv('aes-128-ecb', key, null);
@@ -35,10 +35,21 @@ export function generateAesKey(): Buffer {
 }
 
 /**
+ * Encode AES key for message (hex -> base64)
+ */
+export function encodeMessageAesKey(aeskey: Buffer): string {
+  return Buffer.from(aeskey.toString('hex')).toString('base64');
+}
+
+/**
  * Generate X-WECHAT-UIN header value:
  * base64(String(random_uint32))
  */
 export function generateWechatUin(): string {
   const uint32 = randomBytes(4).readUInt32BE(0);
   return Buffer.from(String(uint32), 'utf-8').toString('base64');
+}
+
+export function md5(data: Buffer | string): string {
+  return createHash('md5').update(data).digest('hex');
 }

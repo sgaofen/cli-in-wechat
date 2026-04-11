@@ -1,6 +1,33 @@
 import { log } from '../utils/logger.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
 import { commandExists, spawnProc, setupAbort, setupTimeout, stripAnsi, isSessionError } from './base.js';
+import type { DownloadedMedia } from '../utils/media.js';
+import { copyMediaToWorkDir } from '../utils/media.js';
+
+function buildMediaPrompt(prompt: string, media?: DownloadedMedia[], workDir?: string): string {
+  if (!media || media.length === 0) return prompt;
+  
+  const copiedMedia = workDir ? media.map(m => copyMediaToWorkDir(m, workDir)) : media;
+  
+  const fileList = copiedMedia.map(m => {
+    const relativePath = workDir && m.path.startsWith(workDir) 
+      ? m.path.slice(workDir.length).replace(/^[\/\\]/, '')
+      : m.path;
+    const typeNames: Record<string, string> = { image: '图片', file: '文件', video: '视频' };
+    const sizeStr = m.size ? `${(m.size / 1024).toFixed(1)}KB` : '未知大小';
+    return `- ${m.fileName}\n  类型: ${typeNames[m.type] || '文件'}\n  大小: ${sizeStr}\n  路径: ${relativePath}`;
+  }).join('\n\n');
+  
+  const userPrompt = prompt.trim() && !prompt.startsWith('[文件:') && !prompt.startsWith('[图片:') && !prompt.startsWith('[视频:')
+    ? `\n\n用户说：${prompt}`
+    : '';
+  
+  return `已接收到用户通过微信发送的文件：
+
+${fileList}
+
+文件已保存到工作目录，等待您的指令。${userPrompt}`;
+}
 
 export class CodexAdapter implements CLIAdapter {
   readonly name = 'codex';
@@ -16,6 +43,8 @@ export class CodexAdapter implements CLIAdapter {
   execute(prompt: string, opts: ExecOptions): Promise<ExecResult> {
     return new Promise((resolve) => {
       const { settings } = opts;
+      const workDir = settings.workDir || opts.workDir;
+      const fullPrompt = buildMediaPrompt(prompt, opts.media, workDir);
       const args: string[] = [];
       const hasSession = settings.sessionIds[this.name];
 
@@ -59,8 +88,8 @@ export class CodexAdapter implements CLIAdapter {
       });
 
       // Pass prompt via stdin to avoid Windows cmd.exe Unicode encoding issues
-      log.debug(`[codex] stdin: ${prompt.substring(0, 200)}${prompt.length > 200 ? '…' : ''}`);
-      proc.stdin!.write(prompt, 'utf8');
+      log.debug(`[codex] stdin: ${fullPrompt.substring(0, 200)}${fullPrompt.length > 200 ? '…' : ''}`);
+      proc.stdin!.write(fullPrompt, 'utf8');
       proc.stdin!.end();
 
       setupAbort(proc, opts.signal);
