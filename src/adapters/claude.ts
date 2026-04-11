@@ -116,6 +116,7 @@ export class ClaudeAdapter implements CLIAdapter {
     log.debug(`[claude/sdk] effort=${settings.effort} mode=${settings.mode} resume=${sid || 'none'}`);
 
     let resultText = '';
+    let thinking = '';
     let sessionId: string | undefined;
     let error = false;
 
@@ -129,6 +130,17 @@ export class ClaudeAdapter implements CLIAdapter {
 
       const msg = message as Record<string, unknown>;
 
+      if (msg.type === 'assistant') {
+        const content = msg.content as Array<{ type: string; thinking?: string }> | undefined;
+        if (content) {
+          for (const block of content) {
+            if (block.type === 'thinking' && block.thinking) {
+              thinking += block.thinking;
+            }
+          }
+        }
+      }
+
       if (msg.type === 'result') {
         const result = msg as Record<string, unknown>;
         resultText = (result.result as string) || '(无输出)';
@@ -139,6 +151,7 @@ export class ClaudeAdapter implements CLIAdapter {
 
     return {
       text: resultText,
+      thinking: thinking || undefined,
       sessionId,
       duration: Date.now() - start,
       error,
@@ -151,7 +164,7 @@ export class ClaudeAdapter implements CLIAdapter {
     return new Promise((resolve) => {
       const { settings } = opts;
       // 使用 stdin 传递提示词，避免 Windows shell 对特殊字符的处理问题
-      const args = ['--output-format', 'json'];
+      const args = ['--output-format', 'stream-json', '--thinking', 'enabled', '--verbose'];
 
       switch (settings.mode) {
         case 'auto': args.push('--dangerously-skip-permissions'); break;
@@ -164,7 +177,6 @@ export class ClaudeAdapter implements CLIAdapter {
       if (settings.allowedTools) args.push('--allowedTools', settings.allowedTools);
       if (settings.disallowedTools) args.push('--disallowedTools', settings.disallowedTools);
       if (settings.systemPrompt) args.push('--append-system-prompt', settings.systemPrompt);
-      if (settings.verbose) args.push('--verbose');
       if (settings.bare) args.push('--bare');
       if (settings.addDir) args.push('--add-dir', settings.addDir);
       if (settings.sessionName) args.push('--name', settings.sessionName);
@@ -194,14 +206,42 @@ export class ClaudeAdapter implements CLIAdapter {
       proc.on('close', (code) => {
         if (timer) clearTimeout(timer);
         if (opts.signal?.aborted) { resolve({ text: '已取消', error: true }); return; }
-        try {
-          const r = JSON.parse(stdout);
-          const isErr = r.is_error || r.subtype !== 'success';
-          const text = r.result || '(无输出)';
-          resolve({ text, sessionId: r.session_id, duration: r.duration_ms, error: isErr, sessionExpired: isErr && !!sid && isSessionError(text) });
-        } catch {
-          const text = stdout.trim() || stderr.trim() || `exit ${code}`;
-          resolve({ text, error: code !== 0, sessionExpired: code !== 0 && !!sid && isSessionError(text) });
+
+        let text = '';
+        let thinking = '';
+        let sessionId: string | undefined;
+        let duration: number | undefined;
+        let isErr = code !== 0;
+
+        const lines = stdout.trim().split('\n');
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const obj = JSON.parse(line);
+            if (obj.type === 'assistant' && obj.message?.content) {
+              for (const block of obj.message.content) {
+                if (block.type === 'thinking' && block.thinking) {
+                  thinking += block.thinking;
+                }
+                if (block.type === 'text' && block.text) {
+                  text += block.text;
+                }
+              }
+            }
+            if (obj.type === 'result') {
+              if (!text) text = obj.result || '(无输出)';
+              sessionId = obj.session_id;
+              duration = obj.duration_ms;
+              isErr = obj.is_error || obj.subtype !== 'success';
+            }
+          } catch { continue; }
+        }
+
+        if (text) {
+          resolve({ text, thinking: thinking || undefined, sessionId, duration, error: isErr, sessionExpired: isErr && !!sid && isSessionError(text) });
+        } else {
+          const fallbackText = stdout.trim() || stderr.trim() || `exit ${code}`;
+          resolve({ text: fallbackText, error: code !== 0, sessionExpired: code !== 0 && !!sid && isSessionError(fallbackText) });
         }
       });
       proc.on('error', (err) => { if (timer) clearTimeout(timer); resolve({ text: `无法启动: ${err.message}`, error: true }); });

@@ -45,7 +45,7 @@ export class OpenCodeAdapter implements CLIAdapter {
       const { settings } = opts;
       const workDir = settings.workDir || opts.workDir;
       const fullPrompt = buildMediaPrompt(prompt, opts.media, workDir);
-      const args = ['run', fullPrompt, '--format', 'json'];
+      const args = ['run', fullPrompt, '--format', 'json', '--thinking'];
 
       if (settings.workDir || opts.workDir) {
         args.push('--dir', settings.workDir || opts.workDir!);
@@ -66,7 +66,7 @@ export class OpenCodeAdapter implements CLIAdapter {
 
       if (opts.extraArgs) args.push(...opts.extraArgs);
 
-      log.debug(`[opencode] executing: run --format json`);
+      log.debug(`[opencode] executing: run --format json --thinking`);
 
       const proc = spawnProc(this.command, args, {
         cwd: settings.workDir || opts.workDir,
@@ -88,6 +88,7 @@ export class OpenCodeAdapter implements CLIAdapter {
 
         try {
           let text = '';
+          let thinking = '';
           let sessionId: string | undefined;
           let hasError = code !== 0;
 
@@ -98,6 +99,9 @@ export class OpenCodeAdapter implements CLIAdapter {
               const obj = JSON.parse(line);
               if (obj.type === 'text' && obj.part?.text) {
                 text += obj.part.text;
+              }
+              if (obj.type === 'reasoning' && obj.part?.text) {
+                thinking += obj.part.text;
               }
               if (obj.sessionID && !sessionId) {
                 sessionId = obj.sessionID;
@@ -111,7 +115,7 @@ export class OpenCodeAdapter implements CLIAdapter {
           }
 
           if (text) {
-            resolve({ text, sessionId, error: hasError });
+            resolve({ text, thinking: thinking || undefined, sessionId, error: hasError });
           } else {
             resolve({ text: stripAnsi(stdout.trim() || stderr.trim()) || `exit ${code}`, error: code !== 0 });
           }

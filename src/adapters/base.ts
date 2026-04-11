@@ -37,6 +37,9 @@ export interface UserSettings {
   approvalMode: string;
   includeDirs: string;
   extensions: string;
+
+  // ── Output ──
+  showThoughts: boolean;
 }
 
 export const DEFAULT_SETTINGS: UserSettings = {
@@ -63,6 +66,7 @@ export const DEFAULT_SETTINGS: UserSettings = {
   approvalMode: '',
   includeDirs: '',
   extensions: '',
+  showThoughts: false,
 };
 
 export interface AskUserRequest {
@@ -85,6 +89,7 @@ export interface ExecOptions {
 
 export interface ExecResult {
   text: string;
+  thinking?: string;
   sessionId?: string;
   cost?: number;
   duration?: number;
