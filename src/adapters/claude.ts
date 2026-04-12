@@ -67,10 +67,15 @@ export class ClaudeAdapter implements CLIAdapter {
     const { settings } = opts;
     const start = Date.now();
 
+    // Load Claude Code settings.json env vars (for custom API endpoints like Qianfan)
+    await this.loadClaudeSettingsEnv();
+
     // Build options
     const sdkOpts: Record<string, unknown> = {
       maxTurns: settings.maxTurns,
       permissionMode: settings.mode === 'auto' ? 'bypassPermissions' : settings.mode === 'plan' ? 'plan' : 'default',
+      // Load all settings sources to get complete skills/commands list
+      settingSources: ['user', 'project', 'local'] as const,
     };
 
     if (settings.effort) sdkOpts.effort = settings.effort;
@@ -91,7 +96,7 @@ export class ClaudeAdapter implements CLIAdapter {
       const askUser = opts.askUser;
       sdkOpts.canUseTool = async (toolName: string, input: Record<string, unknown>) => {
         if (toolName === 'AskUserQuestion') {
-          log.debug('[claude] AskUserQuestion intercepted, forwarding to WeChat');
+          log.debug('[claude] AskUserQuestion input:', JSON.stringify(input, null, 2));
           try {
             const answers = await askUser({
               questions: (input.questions as Array<{
@@ -100,6 +105,7 @@ export class ClaudeAdapter implements CLIAdapter {
                 multiSelect?: boolean;
               }>) || [],
             });
+            log.debug('[claude] AskUserQuestion answers:', JSON.stringify(answers));
             return {
               behavior: 'allow' as const,
               updatedInput: { ...input, answers },
@@ -156,6 +162,33 @@ export class ClaudeAdapter implements CLIAdapter {
       duration: Date.now() - start,
       error,
     };
+  }
+
+  // Load env vars from ~/.claude/settings.json (supports custom API endpoints)
+  private settingsEnvLoaded = false;
+  private async loadClaudeSettingsEnv(): Promise<void> {
+    if (this.settingsEnvLoaded) return;
+    this.settingsEnvLoaded = true;
+
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+    try {
+      const content = await fs.readFile(settingsPath, 'utf-8');
+      const settings = JSON.parse(content);
+      if (settings.env && typeof settings.env === 'object') {
+        for (const [key, value] of Object.entries(settings.env)) {
+          if (typeof value === 'string' && !process.env[key]) {
+            process.env[key] = value;
+            log.debug(`[claude/sdk] set env ${key} from settings.json`);
+          }
+        }
+      }
+    } catch {
+      // Settings file doesn't exist or invalid JSON - ignore
+    }
   }
 
   // ─── CLI fallback (no AskUserQuestion) ─────────────────
