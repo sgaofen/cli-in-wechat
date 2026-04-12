@@ -88,6 +88,8 @@ export interface ExecOptions {
   signal?: AbortSignal;
   askUser?: (req: AskUserRequest) => Promise<Record<string, string>>;
   media?: DownloadedMedia[];
+  /** Callback for streaming intermediate messages to WeChat */
+  onIntermediate?: (msg: IntermediateMessage) => void;
 }
 
 export interface ExecResult {
@@ -99,8 +101,6 @@ export interface ExecResult {
   error?: boolean;
   /** Set by the adapter when the error is positively identified as a session/resume failure. */
   sessionExpired?: boolean;
-  /** Intermediate messages collected during execution (for verbose/normal msgMode) */
-  intermediate?: IntermediateMessage[];
 }
 
 export interface IntermediateMessage {

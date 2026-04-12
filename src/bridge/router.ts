@@ -954,21 +954,23 @@ export class Router {
     prompt: string,
     signal: AbortSignal,
     media?: DownloadedMedia[],
+    onIntermediate?: (msg: import('../adapters/base.js').IntermediateMessage) => void,
   ): Promise<{ result: import('../adapters/base.js').ExecResult; notice: string }> {
     const adapter = this.registry.get(toolName)!;
     const extraArgs = this.config.tools[toolName]?.args;
     const hadSession = adapter.capabilities.sessionResume && !!this.sessions.get(uid).sessionIds[toolName];
 
     if (signal.aborted) return { result: { text: '已取消', error: true }, notice: '' };
-    
+
     // 追加 SEND_FILE 提示到 prompt
     const sendFileHint = '\n\n[提示: 如果需要发送文件/图片到微信，在响应中包含标记 [SEND_FILE: 文件路径]]';
     const enhancedPrompt = prompt + sendFileHint;
-    
+
     const result = await adapter.execute(enhancedPrompt, {
       settings: this.sessions.get(uid), workDir: this.config.workDir, timeout: this.config.cliTimeout, extraArgs, signal,
       askUser: (req) => this.askUserViaWeChat(uid, toolName, req),
       media,
+      onIntermediate,
     });
 
     if (result.sessionExpired && hadSession && !signal.aborted) {
@@ -1043,9 +1045,35 @@ export class Router {
     const stopTyping = await this.ilink.startTyping(uid);
     const start = Date.now();
     const settings = this.sessions.get(uid);
+    const msgMode = settings.msgMode || 'normal';
+
+    // Streaming intermediate messages (for verbose/normal mode)
+    const onIntermediate = msgMode !== 'compact' ? (msg: import('../adapters/base.js').IntermediateMessage) => {
+      // Send each block immediately when received
+      switch (msg.type) {
+        case 'tool_use':
+          this.ilink.sendText(uid, `🔧 ${msg.toolName || 'tool'}...`).catch(() => {});
+          break;
+        case 'thinking':
+          if (msgMode === 'verbose' && msg.content.trim()) {
+            this.ilink.sendText(uid, `💭 ${msg.content}`).catch(() => {});
+          }
+          break;
+        case 'text':
+          if (msg.content.trim()) {
+            this.ilink.sendText(uid, msg.content).catch(() => {});
+          }
+          break;
+        case 'tool_result':
+          if (msgMode === 'verbose' && msg.content.trim()) {
+            this.ilink.sendText(uid, `📤 ${msg.content}`).catch(() => {});
+          }
+          break;
+      }
+    } : undefined;
 
     try {
-      const { result, notice } = await this.runOnce(toolName, uid, prompt, abort.signal, media);
+      const { result, notice } = await this.runOnce(toolName, uid, prompt, abort.signal, media, onIntermediate);
 
       if (abort.signal.aborted) return;
 
@@ -1060,18 +1088,8 @@ export class Router {
       this.lastResponse.set(uid, { tool: adapter.displayName, text: cleanText });
       this.sessions.update(uid, { defaultTool: toolName });
 
-      // Handle intermediate messages based on msgMode
-      const msgMode = settings.msgMode || 'normal';
-      if (msgMode !== 'compact' && result.intermediate && result.intermediate.length > 0) {
-        const intermediateText = this.formatIntermediateMessages(result.intermediate, msgMode);
-        if (intermediateText) {
-          await this.ilink.sendText(uid, intermediateText);
-        }
-      }
-
       // Send thinking content if enabled (or in verbose mode)
       if ((settings.showThoughts || msgMode === 'verbose') && result.thinking) {
-        log.debug(`[exec] sending thinking content, length: ${result.thinking.length}`);
         await this.ilink.sendText(uid, `💭 思考:\n${result.thinking}\n\n---`);
       }
 

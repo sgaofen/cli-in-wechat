@@ -124,9 +124,9 @@ export class ClaudeAdapter implements CLIAdapter {
     let sessionId: string | undefined;
     let error = false;
 
-    // Collect intermediate messages (for verbose/normal mode)
-    const intermediate: IntermediateMessage[] = [];
-    const collectIntermediate = msgMode !== 'compact';
+    // Stream intermediate messages via callback
+    const { onIntermediate } = opts;
+    const streamIntermediate = msgMode !== 'compact' && onIntermediate;
 
     // Track pending tool_use to associate with tool_result
     let pendingToolName: string | undefined;
@@ -149,20 +149,20 @@ export class ClaudeAdapter implements CLIAdapter {
           for (const block of content) {
             if (block.type === 'thinking' && block.thinking) {
               thinking += block.thinking;
-              if (collectIntermediate) {
-                intermediate.push({ type: 'thinking', content: block.thinking });
+              if (streamIntermediate) {
+                onIntermediate({ type: 'thinking', content: block.thinking });
               }
             }
             if (block.type === 'text' && block.text) {
               // Intermediate text output
-              if (collectIntermediate && block.text.trim()) {
-                intermediate.push({ type: 'text', content: block.text });
+              if (streamIntermediate && block.text.trim()) {
+                onIntermediate({ type: 'text', content: block.text });
               }
             }
             if (block.type === 'tool_use') {
               pendingToolName = block.name;
-              if (collectIntermediate) {
-                intermediate.push({ type: 'tool_use', content: '', toolName: block.name });
+              if (streamIntermediate) {
+                onIntermediate({ type: 'tool_use', content: '', toolName: block.name });
               }
             }
           }
@@ -173,10 +173,10 @@ export class ClaudeAdapter implements CLIAdapter {
         // SDK 用 message.content 存储 tool_result
         const msgObj = msg as any;
         const content = msgObj.content || msgObj.message?.content;
-        if (content && collectIntermediate) {
+        if (content && streamIntermediate) {
           for (const block of content) {
             if (block.type === 'tool_result' && block.content) {
-              intermediate.push({
+              onIntermediate({
                 type: 'tool_result',
                 content: block.content,
                 toolName: pendingToolName,
@@ -201,7 +201,6 @@ export class ClaudeAdapter implements CLIAdapter {
       sessionId,
       duration: Date.now() - start,
       error,
-      intermediate: intermediate.length > 0 ? intermediate : undefined,
     };
   }
 
@@ -210,7 +209,6 @@ export class ClaudeAdapter implements CLIAdapter {
   private executeWithCLI(prompt: string, opts: ExecOptions): Promise<ExecResult> {
     return new Promise((resolve) => {
       const { settings } = opts;
-      const msgMode = settings.msgMode || 'compact';
       // 使用 stdin 传递提示词，避免 Windows shell 对特殊字符的处理问题
       const args = ['--output-format', 'stream-json', '--thinking', 'enabled', '--verbose'];
 
@@ -232,7 +230,7 @@ export class ClaudeAdapter implements CLIAdapter {
       if (sid) args.push('--resume', sid);
       if (opts.extraArgs) args.push(...opts.extraArgs);
 
-      log.debug(`[claude] effort=${settings.effort} model=${settings.model || 'default'} mode=${settings.mode} msgMode=${msgMode}`);
+      log.debug(`[claude] effort=${settings.effort} model=${settings.model || 'default'} mode=${settings.mode}`);
       log.debug(`[claude] stdin prompt length: ${prompt.length}`);
 
       const proc = spawnProc(this.command, args, {
@@ -261,11 +259,6 @@ export class ClaudeAdapter implements CLIAdapter {
         let duration: number | undefined;
         let isErr = code !== 0;
 
-        // Collect intermediate messages
-        const intermediate: IntermediateMessage[] = [];
-        const collectIntermediate = msgMode !== 'compact';
-        let pendingToolName: string | undefined;
-
         const lines = stdout.trim().split('\n');
         for (const line of lines) {
           if (!line.trim()) continue;
@@ -275,35 +268,9 @@ export class ClaudeAdapter implements CLIAdapter {
               for (const block of obj.message.content) {
                 if (block.type === 'thinking' && block.thinking) {
                   thinking += block.thinking;
-                  if (collectIntermediate) {
-                    intermediate.push({ type: 'thinking', content: block.thinking });
-                  }
                 }
                 if (block.type === 'text' && block.text) {
                   text += block.text;
-                  if (collectIntermediate && block.text.trim()) {
-                    intermediate.push({ type: 'text', content: block.text });
-                  }
-                }
-                if (block.type === 'tool_use') {
-                  pendingToolName = block.name;
-                  if (collectIntermediate) {
-                    intermediate.push({ type: 'tool_use', content: '', toolName: block.name });
-                  }
-                }
-              }
-            }
-            if (obj.type === 'user' && obj.message?.content) {
-              for (const block of obj.message.content) {
-                if (block.type === 'tool_result' && block.content) {
-                  if (collectIntermediate) {
-                    intermediate.push({
-                      type: 'tool_result',
-                      content: typeof block.content === 'string' ? block.content : JSON.stringify(block.content),
-                      toolName: pendingToolName,
-                    });
-                  }
-                  pendingToolName = undefined;
                 }
               }
             }
@@ -324,7 +291,6 @@ export class ClaudeAdapter implements CLIAdapter {
             duration,
             error: isErr,
             sessionExpired: isErr && !!sid && isSessionError(text),
-            intermediate: intermediate.length > 0 ? intermediate : undefined,
           });
         } else {
           const fallbackText = stdout.trim() || stderr.trim() || `exit ${code}`;
