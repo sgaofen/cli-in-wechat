@@ -442,19 +442,21 @@ export class Router {
             `当前: ${settings.msgMode}`,
             '/msgmode <verbose|normal|compact>',
             '',
-            'verbose - 详细模式: 包含所有中间信息、工具调用',
-            'normal  - 正常模式: 包含中间信息，不含工具调用',
-            'compact - 简洁模式: 仅最终结果 (默认)',
+            'verbose - 显示中间文本 + 工具调用详情',
+            'normal  - 显示中间文本，不含工具调用',
+            'compact - 仅显示最终结果 (默认)',
+            '',
+            '(思考内容由 /thoughts 控制)',
           ].join('\n'));
           return true;
         }
         this.sessions.update(uid, { msgMode: v as any });
         const desc: Record<string, string> = {
-          verbose: 'VERBOSE\n显示所有中间输出、工具调用详情',
-          normal: 'NORMAL\n显示中间思考/文本，不含工具调用',
+          verbose: 'VERBOSE\n显示中间文本 + 工具调用详情',
+          normal: 'NORMAL\n显示中间文本，不含工具调用',
           compact: 'COMPACT\n仅显示最终结果',
         };
-        await reply(desc[v]);
+        await reply(desc[v] + '\n\n(思考内容由 /thoughts 控制)');
         return true;
       }
 
@@ -1047,6 +1049,9 @@ export class Router {
     const settings = this.sessions.get(uid);
     const msgMode = settings.msgMode || 'normal';
 
+    // Track if we've streamed text (to avoid duplicate with final result)
+    let hasStreamedText = false;
+
     // Streaming intermediate messages (for verbose/normal mode)
     const onIntermediate = msgMode !== 'compact' ? (msg: import('../adapters/base.js').IntermediateMessage) => {
       // Send each block immediately when received
@@ -1055,12 +1060,14 @@ export class Router {
           this.ilink.sendText(uid, `🔧 ${msg.toolName || 'tool'}...`).catch(() => {});
           break;
         case 'thinking':
-          if (msgMode === 'verbose' && msg.content.trim()) {
+          // thinking 显示只由 showThoughts 控制，与 msgMode 无关
+          if (settings.showThoughts && msg.content.trim()) {
             this.ilink.sendText(uid, `💭 ${msg.content}`).catch(() => {});
           }
           break;
         case 'text':
           if (msg.content.trim()) {
+            hasStreamedText = true;
             this.ilink.sendText(uid, msg.content).catch(() => {});
           }
           break;
@@ -1088,8 +1095,8 @@ export class Router {
       this.lastResponse.set(uid, { tool: adapter.displayName, text: cleanText });
       this.sessions.update(uid, { defaultTool: toolName });
 
-      // Send thinking content if enabled (or in verbose mode)
-      if ((settings.showThoughts || msgMode === 'verbose') && result.thinking) {
+      // Send thinking content if enabled (only in compact mode, non-compact already streamed)
+      if (settings.showThoughts && result.thinking && msgMode === 'compact') {
         await this.ilink.sendText(uid, `💭 思考:\n${result.thinking}\n\n---`);
       }
 
@@ -1097,11 +1104,21 @@ export class Router {
         ? `\n[已发送文件: ${sentFiles.join(', ')}]`
         : '';
 
-      await this.ilink.sendText(uid, formatResponse(notice + cleanText + sentNotice, {
-        tool: adapter.displayName,
-        duration: result.duration || (Date.now() - start),
-        error: result.error,
-      }));
+      // If text was already streamed, only send footer (avoid duplicate)
+      if (hasStreamedText) {
+        await this.ilink.sendText(uid, formatResponse(notice + sentNotice, {
+          tool: adapter.displayName,
+          duration: result.duration || (Date.now() - start),
+          error: result.error,
+        }));
+      } else {
+        // compact mode or no streamed text: send full result
+        await this.ilink.sendText(uid, formatResponse(notice + cleanText + sentNotice, {
+          tool: adapter.displayName,
+          duration: result.duration || (Date.now() - start),
+          error: result.error,
+        }));
+      }
     } catch (err: unknown) {
       if (!abort.signal.aborted) {
         log.error(`[${toolName}] 失败:`, err);
