@@ -9,7 +9,7 @@ import { SessionManager } from './session.js';
 import { formatResponse } from './formatter.js';
 import type { WeixinMessage } from '../ilink/types.js';
 import type { BridgeConfig } from '../config.js';
-import type { AskUserRequest } from '../adapters/base.js';
+import { DEFAULT_SETTINGS, type AskUserRequest, type MsgMode } from '../adapters/base.js';
 import type { DownloadedMedia } from '../utils/media.js';
 
 interface ActiveTask { abort: AbortController; tool: string }
@@ -65,6 +65,16 @@ export class Router {
       if (resolved && this.registry.isAvailable(resolved)) return resolved;
     }
     return this.sessions.get(uid).defaultTool || this.config.defaultTool;
+  }
+
+  private getDefaultMsgMode(): MsgMode {
+    return this.normalizeMsgMode(DEFAULT_SETTINGS.msgMode);
+  }
+
+  private normalizeMsgMode(mode?: string): MsgMode {
+    const v = (mode || '').toLowerCase();
+    if (v === 'verbose' || v === 'normal' || v === 'compact') return v;
+    return DEFAULT_SETTINGS.msgMode;
   }
 
 
@@ -193,7 +203,7 @@ export class Router {
           '/system <词>  追加系统提示',
           '/tools <列表>  允许工具',
           '/notool <列表>  禁用工具',
-          '/verbose  详细输出',
+          '/verbose  CLI详细输出(Kimi)',
           '/bare  跳过配置加载',
           '/adddir <路径>  额外目录',
           '/name <名>  会话命名',
@@ -206,7 +216,7 @@ export class Router {
           '/ext <名>  扩展(Gemini)',
           '/thinking  深度思考(Kimi)',
           '/thoughts  显示AI思考内容',
-          '/msgmode <verbose|normal|compact>  消息详细度',
+          '/msgmode <verbose|normal|compact|default>  消息详细度',
           '',
           '— 操作 —',
           '/diff  查看git差异',
@@ -241,6 +251,8 @@ export class Router {
 
       case 'status': case 'st': {
         const def = settings.defaultTool || this.config.defaultTool;
+        const currentMsgMode = this.normalizeMsgMode(settings.msgMode);
+        const defaultMsgMode = this.getDefaultMsgMode();
         const sids = Object.entries(settings.sessionIds).map(([k, v]) => `${k}:${String(v).substring(0, 8)}`).join(' ') || '无';
         const lines = [
           `工具: ${def}`,
@@ -251,7 +263,9 @@ export class Router {
           `budget: ${settings.maxBudget > 0 ? '$' + settings.maxBudget : '无限'}`,
           `sandbox: ${settings.sandbox || '无'}`,
           `search: ${settings.search ? 'ON' : 'OFF'}`,
-          `verbose: ${settings.verbose ? 'ON' : 'OFF'}`,
+          `msgMode: ${currentMsgMode} (默认: ${defaultMsgMode})`,
+          `thoughts: ${settings.showThoughts ? 'ON' : 'OFF'}`,
+          `cliVerbose: ${settings.verbose ? 'ON' : 'OFF'} (Kimi)`,
           `system: ${settings.systemPrompt ? settings.systemPrompt.substring(0, 40) + '...' : '无'}`,
           `dir: ${settings.workDir || this.config.workDir}`,
           `会话: ${sids}`,
@@ -374,7 +388,7 @@ export class Router {
 
       case 'verbose': case 'v':
         this.sessions.update(uid, { verbose: !settings.verbose });
-        await reply(`verbose → ${!settings.verbose ? 'ON' : 'OFF'}`);
+        await reply(`verbose(Kimi CLI) → ${!settings.verbose ? 'ON' : 'OFF'}`);
         return true;
 
       // ═══════════════════════════════════════════
@@ -429,34 +443,66 @@ export class Router {
       }
 
       case 'msgmode': {
-        const modes: Record<string, string> = {
+        const defaultMode = this.getDefaultMsgMode();
+        const currentMode = this.normalizeMsgMode(settings.msgMode);
+        const highRiskNow = currentMode === 'verbose' && !!settings.showThoughts;
+        const warning = '⚠️ 警告: 高频交互任务（如浏览器操作）不建议同时开启 /thoughts + /msgmode verbose，可能触发 iLink 限流，通常约 2-3 分钟恢复。';
+        const modes: Record<string, MsgMode> = {
           verbose: 'verbose',
           detailed: 'verbose',
           normal: 'normal',
           compact: 'compact',
           simple: 'compact',
         };
-        const v = modes[arg.toLowerCase()];
-        if (!v) {
+        if (!arg) {
           await reply([
-            `当前: ${settings.msgMode}`,
-            '/msgmode <verbose|normal|compact>',
+            `当前: ${currentMode}`,
+            `默认: ${defaultMode}`,
+            '/msgmode <verbose|normal|compact|default>',
             '',
-            'verbose - 显示中间文本 + 工具调用详情',
-            'normal  - 显示中间文本，不含工具调用',
-            'compact - 仅显示最终结果 (默认)',
+            'verbose - 流式显示文本 + Activity(含摘要)',
+            'normal  - 流式显示文本，Activity仅在最终结果展示',
+            'compact - 仅显示最终结果',
             '',
             '(思考内容由 /thoughts 控制)',
+            '',
+            warning,
+            `当前风险: ${highRiskNow ? '高' : '正常'}`,
           ].join('\n'));
           return true;
         }
-        this.sessions.update(uid, { msgMode: v as any });
-        const desc: Record<string, string> = {
-          verbose: 'VERBOSE\n显示中间文本 + 工具调用详情',
-          normal: 'NORMAL\n显示中间文本，不含工具调用',
-          compact: 'COMPACT\n仅显示最终结果',
+
+        const lower = arg.toLowerCase();
+        if (lower === 'default' || lower === 'reset') {
+          this.sessions.update(uid, { msgMode: defaultMode });
+          const risk = defaultMode === 'verbose' && !!settings.showThoughts ? '高' : '正常';
+          await reply(`msgmode: ${currentMode} → ${defaultMode}\n当前: ${defaultMode} | 默认: ${defaultMode}\n当前风险: ${risk}\n\n${warning}`);
+          return true;
+        }
+
+        const v = modes[lower];
+        if (!v) {
+          await reply(`无效 msgmode: ${arg}\n当前: ${currentMode}\n默认: ${defaultMode}\n/msgmode <verbose|normal|compact|default>`);
+          return true;
+        }
+
+        this.sessions.update(uid, { msgMode: v });
+        const desc: Record<MsgMode, string> = {
+          verbose: '流式显示文本 + Activity(含摘要)',
+          normal: '流式显示文本，Activity仅在最终结果展示',
+          compact: '仅显示最终结果',
         };
-        await reply(desc[v] + '\n\n(思考内容由 /thoughts 控制)');
+        const highRisk = v === 'verbose' && !!settings.showThoughts;
+        await reply([
+          `msgmode: ${currentMode} → ${v}`,
+          `当前: ${v} | 默认: ${defaultMode}`,
+          `当前风险: ${highRisk ? '高' : '正常'}`,
+          '',
+          desc[v],
+          '',
+          '(思考内容由 /thoughts 控制)',
+          ...(highRisk ? ['', warning] : []),
+        ].join('\n'));
         return true;
       }
 
@@ -513,7 +559,7 @@ export class Router {
           allowedTools: '', disallowedTools: '', verbose: false, sandbox: '',
           search: false, systemPrompt: '', workDir: '', bare: false, addDir: '',
           sessionName: '', ephemeral: false, profile: '', approvalMode: '',
-          includeDirs: '', extensions: '',
+          includeDirs: '', extensions: '', showThoughts: false, msgMode: this.getDefaultMsgMode(),
         } as any);
         await reply('所有设置已重置');
         return true;
@@ -1047,33 +1093,100 @@ export class Router {
     const stopTyping = await this.ilink.startTyping(uid);
     const start = Date.now();
     const settings = this.sessions.get(uid);
-    const msgMode = settings.msgMode || 'normal';
+    const msgMode = this.normalizeMsgMode(settings.msgMode);
 
     // Track if we've streamed text (to avoid duplicate with final result)
     let hasStreamedText = false;
+    let intermediateSendFailed = false;
+
+    // Serialize intermediate sends in-order to avoid burst/concurrency.
+    let sendQueue: Promise<void> = Promise.resolve();
+    const enqueueIntermediateSend = (text: string): void => {
+      if (!text.trim()) return;
+      sendQueue = sendQueue
+        .then(() => this.ilink.sendText(uid, text, { streamType: 'intermediate' }))
+        .catch((err) => {
+          intermediateSendFailed = true;
+          log.error(`[${toolName}] 发送中间消息失败:`, err);
+        });
+    };
+
+    // Keep text/thinking and tool activity as two independent streams.
+    // This allows tool blocks to be sent as standalone messages while preserving order.
+    const textLines: string[] = [];
+    const activityLines: string[] = [];
+    const finalActivityLines: string[] = [];
+    let textFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const flushTextBatch = (): void => {
+      if (textFlushTimer) {
+        clearTimeout(textFlushTimer);
+        textFlushTimer = null;
+      }
+      if (textLines.length === 0) return;
+      const payload = textLines.join('\n\n');
+      textLines.length = 0;
+      enqueueIntermediateSend(payload);
+    };
+
+    const flushActivityBatch = (): void => {
+      if (msgMode !== 'verbose') {
+        activityLines.length = 0;
+        return;
+      }
+      if (activityLines.length === 0) return;
+      const payload = ['Activity', ...activityLines].join('\n');
+      activityLines.length = 0;
+      enqueueIntermediateSend(payload);
+    };
+
+    const scheduleTextFlush = (): void => {
+      if (textFlushTimer) clearTimeout(textFlushTimer);
+      textFlushTimer = setTimeout(() => {
+        textFlushTimer = null;
+        flushTextBatch();
+      }, 2500);
+    };
 
     // Streaming intermediate messages (for verbose/normal mode)
     const onIntermediate = msgMode !== 'compact' ? (msg: import('../adapters/base.js').IntermediateMessage) => {
-      // Send each block immediately when received
+      const content = typeof msg.content === 'string' ? msg.content.trim() : '';
       switch (msg.type) {
         case 'tool_use':
-          this.ilink.sendText(uid, `🔧 ${msg.toolName || 'tool'}...`).catch(() => {});
+          if (msgMode === 'normal') {
+            finalActivityLines.push(content || `- ${msg.toolName || 'Tool'}`);
+          } else if (msgMode === 'verbose') {
+            // Boundary: flush pending text first, then append activity.
+            flushTextBatch();
+            if (content) {
+              activityLines.push(content);
+            } else {
+              activityLines.push(`- ${msg.toolName || 'Tool'}`);
+            }
+          }
           break;
         case 'thinking':
           // thinking 显示只由 showThoughts 控制，与 msgMode 无关
-          if (settings.showThoughts && msg.content.trim()) {
-            this.ilink.sendText(uid, `💭 ${msg.content}`).catch(() => {});
+          if (settings.showThoughts && content) {
+            // Boundary: flush pending activity first, then append text.
+            flushActivityBatch();
+            textLines.push(`💭 ${content}`);
+            scheduleTextFlush();
           }
           break;
         case 'text':
-          if (msg.content.trim()) {
+          if (content) {
             hasStreamedText = true;
-            this.ilink.sendText(uid, msg.content).catch(() => {});
+            // Boundary: flush pending activity first, then append text.
+            flushActivityBatch();
+            textLines.push(content);
+            scheduleTextFlush();
           }
           break;
         case 'tool_result':
-          if (msgMode === 'verbose' && msg.content.trim()) {
-            this.ilink.sendText(uid, `📤 ${msg.content}`).catch(() => {});
+          if (msgMode === 'verbose' && content) {
+            flushTextBatch();
+            activityLines.push(content);
           }
           break;
       }
@@ -1081,6 +1194,11 @@ export class Router {
 
     try {
       const { result, notice } = await this.runOnce(toolName, uid, prompt, abort.signal, media, onIntermediate);
+
+      // Ensure all buffered intermediate content is emitted before final response.
+      flushTextBatch();
+      flushActivityBatch();
+      await sendQueue;
 
       if (abort.signal.aborted) return;
 
@@ -1104,16 +1222,23 @@ export class Router {
         ? `\n[已发送文件: ${sentFiles.join(', ')}]`
         : '';
 
-      // If text was already streamed, only send footer (avoid duplicate)
+      const finalActivityBlock = msgMode === 'normal' && finalActivityLines.length > 0
+        ? `Activity\n${finalActivityLines.join('\n')}\n\n`
+        : '';
+
+      // If text was already streamed, only send footer (avoid duplicate large-body resend).
       if (hasStreamedText) {
-        await this.ilink.sendText(uid, formatResponse(notice + sentNotice, {
+        const tailNotice = intermediateSendFailed
+          ? `${notice}[部分中间消息发送失败]${sentNotice}`
+          : `${notice}${sentNotice}`;
+        await this.ilink.sendText(uid, formatResponse(`${finalActivityBlock}${tailNotice}`.trim(), {
           tool: adapter.displayName,
           duration: result.duration || (Date.now() - start),
           error: result.error,
         }));
       } else {
         // compact mode or no streamed text: send full result
-        await this.ilink.sendText(uid, formatResponse(notice + cleanText + sentNotice, {
+        await this.ilink.sendText(uid, formatResponse(`${finalActivityBlock}${notice}${cleanText}${sentNotice}`, {
           tool: adapter.displayName,
           duration: result.duration || (Date.now() - start),
           error: result.error,
@@ -1125,6 +1250,8 @@ export class Router {
         await this.ilink.sendText(uid, `失败: ${(err as Error).message}`);
       }
     } finally {
+      // Defensive cleanup for pending timer when task exits early.
+      if (textFlushTimer) clearTimeout(textFlushTimer);
       stopTyping();
       this.active.delete(`${uid}:${toolName}`);
     }
