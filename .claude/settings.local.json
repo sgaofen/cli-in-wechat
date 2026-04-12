@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm show:*)",
+      "Bash(claude --version)",
+      "Bash(claude auth:*)",
+      "Bash(node:*)",
+      "Bash(npm run:*)"
+    ]
+  }
+}
