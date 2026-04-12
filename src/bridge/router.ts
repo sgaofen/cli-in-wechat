@@ -206,6 +206,7 @@ export class Router {
           '/ext <名>  扩展(Gemini)',
           '/thinking  深度思考(Kimi)',
           '/thoughts  显示AI思考内容',
+          '/msgmode <verbose|normal|compact>  消息详细度',
           '',
           '— 操作 —',
           '/diff  查看git差异',
@@ -424,6 +425,38 @@ export class Router {
         const newValue = !settings.showThoughts;
         this.sessions.update(uid, { showThoughts: newValue });
         await reply(`thoughts → ${newValue ? '已开启 (将显示AI思考)' : '已关闭'}`);
+        return true;
+      }
+
+      case 'msgmode': {
+        const modes: Record<string, string> = {
+          verbose: 'verbose',
+          detailed: 'verbose',
+          normal: 'normal',
+          compact: 'compact',
+          simple: 'compact',
+        };
+        const v = modes[arg.toLowerCase()];
+        if (!v) {
+          await reply([
+            `当前: ${settings.msgMode}`,
+            '/msgmode <verbose|normal|compact>',
+            '',
+            'verbose - 显示中间文本 + 工具调用详情',
+            'normal  - 显示中间文本，不含工具调用',
+            'compact - 仅显示最终结果 (默认)',
+            '',
+            '(思考内容由 /thoughts 控制)',
+          ].join('\n'));
+          return true;
+        }
+        this.sessions.update(uid, { msgMode: v as any });
+        const desc: Record<string, string> = {
+          verbose: 'VERBOSE\n显示中间文本 + 工具调用详情',
+          normal: 'NORMAL\n显示中间文本，不含工具调用',
+          compact: 'COMPACT\n仅显示最终结果',
+        };
+        await reply(desc[v] + '\n\n(思考内容由 /thoughts 控制)');
         return true;
       }
 
@@ -923,21 +956,23 @@ export class Router {
     prompt: string,
     signal: AbortSignal,
     media?: DownloadedMedia[],
+    onIntermediate?: (msg: import('../adapters/base.js').IntermediateMessage) => void,
   ): Promise<{ result: import('../adapters/base.js').ExecResult; notice: string }> {
     const adapter = this.registry.get(toolName)!;
     const extraArgs = this.config.tools[toolName]?.args;
     const hadSession = adapter.capabilities.sessionResume && !!this.sessions.get(uid).sessionIds[toolName];
 
     if (signal.aborted) return { result: { text: '已取消', error: true }, notice: '' };
-    
+
     // 追加 SEND_FILE 提示到 prompt
     const sendFileHint = '\n\n[提示: 如果需要发送文件/图片到微信，在响应中包含标记 [SEND_FILE: 文件路径]]';
     const enhancedPrompt = prompt + sendFileHint;
-    
+
     const result = await adapter.execute(enhancedPrompt, {
       settings: this.sessions.get(uid), workDir: this.config.workDir, timeout: this.config.cliTimeout, extraArgs, signal,
       askUser: (req) => this.askUserViaWeChat(uid, toolName, req),
       media,
+      onIntermediate,
     });
 
     if (result.sessionExpired && hadSession && !signal.aborted) {
@@ -1012,9 +1047,40 @@ export class Router {
     const stopTyping = await this.ilink.startTyping(uid);
     const start = Date.now();
     const settings = this.sessions.get(uid);
+    const msgMode = settings.msgMode || 'normal';
+
+    // Track if we've streamed text (to avoid duplicate with final result)
+    let hasStreamedText = false;
+
+    // Streaming intermediate messages (for verbose/normal mode)
+    const onIntermediate = msgMode !== 'compact' ? (msg: import('../adapters/base.js').IntermediateMessage) => {
+      // Send each block immediately when received
+      switch (msg.type) {
+        case 'tool_use':
+          this.ilink.sendText(uid, `🔧 ${msg.toolName || 'tool'}...`).catch(() => {});
+          break;
+        case 'thinking':
+          // thinking 显示只由 showThoughts 控制，与 msgMode 无关
+          if (settings.showThoughts && msg.content.trim()) {
+            this.ilink.sendText(uid, `💭 ${msg.content}`).catch(() => {});
+          }
+          break;
+        case 'text':
+          if (msg.content.trim()) {
+            hasStreamedText = true;
+            this.ilink.sendText(uid, msg.content).catch(() => {});
+          }
+          break;
+        case 'tool_result':
+          if (msgMode === 'verbose' && msg.content.trim()) {
+            this.ilink.sendText(uid, `📤 ${msg.content}`).catch(() => {});
+          }
+          break;
+      }
+    } : undefined;
 
     try {
-      const { result, notice } = await this.runOnce(toolName, uid, prompt, abort.signal, media);
+      const { result, notice } = await this.runOnce(toolName, uid, prompt, abort.signal, media, onIntermediate);
 
       if (abort.signal.aborted) return;
 
@@ -1029,23 +1095,30 @@ export class Router {
       this.lastResponse.set(uid, { tool: adapter.displayName, text: cleanText });
       this.sessions.update(uid, { defaultTool: toolName });
 
-      // Send thinking content first if enabled
-      if (settings.showThoughts && result.thinking) {
-        log.debug(`[exec] sending thinking content, length: ${result.thinking.length}`);
-        await this.ilink.sendText(uid, `THINKING:\n\n${result.thinking}\n\n---`);
-      } else if (settings.showThoughts) {
-        log.debug(`[exec] showThoughts is ON but no thinking content`);
+      // Send thinking content if enabled (only in compact mode, non-compact already streamed)
+      if (settings.showThoughts && result.thinking && msgMode === 'compact') {
+        await this.ilink.sendText(uid, `💭 思考:\n${result.thinking}\n\n---`);
       }
 
-      const sentNotice = sentFiles.length > 0 
-        ? `\n[已发送文件: ${sentFiles.join(', ')}]` 
+      const sentNotice = sentFiles.length > 0
+        ? `\n[已发送文件: ${sentFiles.join(', ')}]`
         : '';
 
-      await this.ilink.sendText(uid, formatResponse(notice + cleanText + sentNotice, {
-        tool: adapter.displayName,
-        duration: result.duration || (Date.now() - start),
-        error: result.error,
-      }));
+      // If text was already streamed, only send footer (avoid duplicate)
+      if (hasStreamedText) {
+        await this.ilink.sendText(uid, formatResponse(notice + sentNotice, {
+          tool: adapter.displayName,
+          duration: result.duration || (Date.now() - start),
+          error: result.error,
+        }));
+      } else {
+        // compact mode or no streamed text: send full result
+        await this.ilink.sendText(uid, formatResponse(notice + cleanText + sentNotice, {
+          tool: adapter.displayName,
+          duration: result.duration || (Date.now() - start),
+          error: result.error,
+        }));
+      }
     } catch (err: unknown) {
       if (!abort.signal.aborted) {
         log.error(`[${toolName}] 失败:`, err);
@@ -1055,6 +1128,38 @@ export class Router {
       stopTyping();
       this.active.delete(`${uid}:${toolName}`);
     }
+  }
+
+  private formatIntermediateMessages(messages: import('../adapters/base.js').IntermediateMessage[], mode: string): string {
+    const parts: string[] = [];
+
+    for (const msg of messages) {
+      switch (msg.type) {
+        case 'thinking':
+          if (mode === 'verbose') {
+            parts.push(`\n💭 思考: ${msg.content.substring(0, 200)}${msg.content.length > 200 ? '...' : ''}`);
+          }
+          break;
+        case 'text':
+          if (msg.content.trim()) {
+            parts.push(`\n💬 ${msg.content.substring(0, 300)}${msg.content.length > 300 ? '...' : ''}`);
+          }
+          break;
+        case 'tool_use':
+          if (mode === 'verbose') {
+            parts.push(`\n🔧 调用工具: ${msg.toolName || 'unknown'}`);
+          }
+          break;
+        case 'tool_result':
+          if (mode === 'verbose') {
+            const preview = msg.content.substring(0, 200);
+            parts.push(`\n📤 结果: ${preview}${msg.content.length > 200 ? '...' : ''}`);
+          }
+          break;
+      }
+    }
+
+    return parts.length > 0 ? parts.join('\n') : '';
   }
 
   private async parseAndSendFiles(uid: string, text: string): Promise<{ text: string; sentFiles: string[] }> {

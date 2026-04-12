@@ -3,6 +3,7 @@ import { log } from '../utils/logger.js';
 import type { DownloadedMedia } from '../utils/media.js';
 
 export type ToolMode = 'auto' | 'safe' | 'plan';
+export type MsgMode = 'verbose' | 'normal' | 'compact';
 
 export interface UserSettings {
   // ── Universal ──
@@ -40,6 +41,7 @@ export interface UserSettings {
 
   // ── Output ──
   showThoughts: boolean;
+  msgMode: MsgMode;
 }
 
 export const DEFAULT_SETTINGS: UserSettings = {
@@ -67,6 +69,7 @@ export const DEFAULT_SETTINGS: UserSettings = {
   includeDirs: '',
   extensions: '',
   showThoughts: false,
+  msgMode: 'normal',
 };
 
 export interface AskUserRequest {
@@ -85,6 +88,8 @@ export interface ExecOptions {
   signal?: AbortSignal;
   askUser?: (req: AskUserRequest) => Promise<Record<string, string>>;
   media?: DownloadedMedia[];
+  /** Callback for streaming intermediate messages to WeChat */
+  onIntermediate?: (msg: IntermediateMessage) => void;
 }
 
 export interface ExecResult {
@@ -96,6 +101,12 @@ export interface ExecResult {
   error?: boolean;
   /** Set by the adapter when the error is positively identified as a session/resume failure. */
   sessionExpired?: boolean;
+}
+
+export interface IntermediateMessage {
+  type: 'thinking' | 'text' | 'tool_use' | 'tool_result';
+  content: string;
+  toolName?: string;
 }
 
 export interface AdapterCapabilities {
