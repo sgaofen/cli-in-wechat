@@ -1,5 +1,5 @@
 import { log } from '../utils/logger.js';
-import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
+import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities, IntermediateMessage } from './base.js';
 import { commandExists, spawnProc, setupAbort, setupTimeout, isSessionError } from './base.js';
 import type { DownloadedMedia } from '../utils/media.js';
 import { copyMediaToWorkDir } from '../utils/media.js';
@@ -66,11 +66,14 @@ export class ClaudeAdapter implements CLIAdapter {
     const { query } = await import('@anthropic-ai/claude-agent-sdk');
     const { settings } = opts;
     const start = Date.now();
+    const msgMode = settings.msgMode || 'compact';
 
     // Build options
     const sdkOpts: Record<string, unknown> = {
       maxTurns: settings.maxTurns,
       permissionMode: settings.mode === 'auto' ? 'bypassPermissions' : settings.mode === 'plan' ? 'plan' : 'default',
+      // Load all settings sources to get complete skills/commands list
+      settingSources: ['user', 'project', 'local'] as const,
     };
 
     if (settings.effort) sdkOpts.effort = settings.effort;
@@ -91,7 +94,7 @@ export class ClaudeAdapter implements CLIAdapter {
       const askUser = opts.askUser;
       sdkOpts.canUseTool = async (toolName: string, input: Record<string, unknown>) => {
         if (toolName === 'AskUserQuestion') {
-          log.debug('[claude] AskUserQuestion intercepted, forwarding to WeChat');
+          log.debug('[claude] AskUserQuestion input:', JSON.stringify(input, null, 2));
           try {
             const answers = await askUser({
               questions: (input.questions as Array<{
@@ -100,6 +103,7 @@ export class ClaudeAdapter implements CLIAdapter {
                 multiSelect?: boolean;
               }>) || [],
             });
+            log.debug('[claude] AskUserQuestion answers:', JSON.stringify(answers));
             return {
               behavior: 'allow' as const,
               updatedInput: { ...input, answers },
@@ -113,12 +117,19 @@ export class ClaudeAdapter implements CLIAdapter {
       };
     }
 
-    log.debug(`[claude/sdk] effort=${settings.effort} mode=${settings.mode} resume=${sid || 'none'}`);
+    log.debug(`[claude/sdk] effort=${settings.effort} mode=${settings.mode} msgMode=${msgMode} resume=${sid || 'none'}`);
 
     let resultText = '';
     let thinking = '';
     let sessionId: string | undefined;
     let error = false;
+
+    // Collect intermediate messages (for verbose/normal mode)
+    const intermediate: IntermediateMessage[] = [];
+    const collectIntermediate = msgMode !== 'compact';
+
+    // Track pending tool_use to associate with tool_result
+    let pendingToolName: string | undefined;
 
     for await (const message of query({
       prompt,
@@ -131,11 +142,50 @@ export class ClaudeAdapter implements CLIAdapter {
       const msg = message as Record<string, unknown>;
 
       if (msg.type === 'assistant') {
-        const content = msg.content as Array<{ type: string; thinking?: string }> | undefined;
+        const content = msg.content as Array<{
+          type: string;
+          thinking?: string;
+          text?: string;
+          name?: string;
+        }> | undefined;
         if (content) {
           for (const block of content) {
             if (block.type === 'thinking' && block.thinking) {
               thinking += block.thinking;
+              if (collectIntermediate) {
+                intermediate.push({ type: 'thinking', content: block.thinking });
+              }
+            }
+            if (block.type === 'text' && block.text) {
+              // Intermediate text output
+              if (collectIntermediate && block.text.trim()) {
+                intermediate.push({ type: 'text', content: block.text });
+              }
+            }
+            if (block.type === 'tool_use') {
+              pendingToolName = block.name;
+              if (collectIntermediate) {
+                intermediate.push({ type: 'tool_use', content: '', toolName: block.name });
+              }
+            }
+          }
+        }
+      }
+
+      if (msg.type === 'user') {
+        const content = msg.content as Array<{
+          type: string;
+          content?: string;
+        }> | undefined;
+        if (content && collectIntermediate) {
+          for (const block of content) {
+            if (block.type === 'tool_result' && block.content) {
+              intermediate.push({
+                type: 'tool_result',
+                content: block.content,
+                toolName: pendingToolName,
+              });
+              pendingToolName = undefined;
             }
           }
         }
@@ -155,6 +205,7 @@ export class ClaudeAdapter implements CLIAdapter {
       sessionId,
       duration: Date.now() - start,
       error,
+      intermediate: intermediate.length > 0 ? intermediate : undefined,
     };
   }
 
@@ -163,6 +214,7 @@ export class ClaudeAdapter implements CLIAdapter {
   private executeWithCLI(prompt: string, opts: ExecOptions): Promise<ExecResult> {
     return new Promise((resolve) => {
       const { settings } = opts;
+      const msgMode = settings.msgMode || 'compact';
       // 使用 stdin 传递提示词，避免 Windows shell 对特殊字符的处理问题
       const args = ['--output-format', 'stream-json', '--thinking', 'enabled', '--verbose'];
 
@@ -184,9 +236,9 @@ export class ClaudeAdapter implements CLIAdapter {
       if (sid) args.push('--resume', sid);
       if (opts.extraArgs) args.push(...opts.extraArgs);
 
-      log.debug(`[claude] effort=${settings.effort} model=${settings.model || 'default'} mode=${settings.mode}`);
+      log.debug(`[claude] effort=${settings.effort} model=${settings.model || 'default'} mode=${settings.mode} msgMode=${msgMode}`);
       log.debug(`[claude] stdin prompt length: ${prompt.length}`);
-      
+
       const proc = spawnProc(this.command, args, {
         cwd: settings.workDir || opts.workDir,
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -213,6 +265,11 @@ export class ClaudeAdapter implements CLIAdapter {
         let duration: number | undefined;
         let isErr = code !== 0;
 
+        // Collect intermediate messages
+        const intermediate: IntermediateMessage[] = [];
+        const collectIntermediate = msgMode !== 'compact';
+        let pendingToolName: string | undefined;
+
         const lines = stdout.trim().split('\n');
         for (const line of lines) {
           if (!line.trim()) continue;
@@ -222,9 +279,35 @@ export class ClaudeAdapter implements CLIAdapter {
               for (const block of obj.message.content) {
                 if (block.type === 'thinking' && block.thinking) {
                   thinking += block.thinking;
+                  if (collectIntermediate) {
+                    intermediate.push({ type: 'thinking', content: block.thinking });
+                  }
                 }
                 if (block.type === 'text' && block.text) {
                   text += block.text;
+                  if (collectIntermediate && block.text.trim()) {
+                    intermediate.push({ type: 'text', content: block.text });
+                  }
+                }
+                if (block.type === 'tool_use') {
+                  pendingToolName = block.name;
+                  if (collectIntermediate) {
+                    intermediate.push({ type: 'tool_use', content: '', toolName: block.name });
+                  }
+                }
+              }
+            }
+            if (obj.type === 'user' && obj.message?.content) {
+              for (const block of obj.message.content) {
+                if (block.type === 'tool_result' && block.content) {
+                  if (collectIntermediate) {
+                    intermediate.push({
+                      type: 'tool_result',
+                      content: typeof block.content === 'string' ? block.content : JSON.stringify(block.content),
+                      toolName: pendingToolName,
+                    });
+                  }
+                  pendingToolName = undefined;
                 }
               }
             }
@@ -238,7 +321,15 @@ export class ClaudeAdapter implements CLIAdapter {
         }
 
         if (text) {
-          resolve({ text, thinking: thinking || undefined, sessionId, duration, error: isErr, sessionExpired: isErr && !!sid && isSessionError(text) });
+          resolve({
+            text,
+            thinking: thinking || undefined,
+            sessionId,
+            duration,
+            error: isErr,
+            sessionExpired: isErr && !!sid && isSessionError(text),
+            intermediate: intermediate.length > 0 ? intermediate : undefined,
+          });
         } else {
           const fallbackText = stdout.trim() || stderr.trim() || `exit ${code}`;
           resolve({ text: fallbackText, error: code !== 0, sessionExpired: code !== 0 && !!sid && isSessionError(fallbackText) });

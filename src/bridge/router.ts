@@ -206,6 +206,7 @@ export class Router {
           '/ext <名>  扩展(Gemini)',
           '/thinking  深度思考(Kimi)',
           '/thoughts  显示AI思考内容',
+          '/msgmode <verbose|normal|compact>  消息详细度',
           '',
           '— 操作 —',
           '/diff  查看git差异',
@@ -424,6 +425,36 @@ export class Router {
         const newValue = !settings.showThoughts;
         this.sessions.update(uid, { showThoughts: newValue });
         await reply(`thoughts → ${newValue ? '已开启 (将显示AI思考)' : '已关闭'}`);
+        return true;
+      }
+
+      case 'msgmode': {
+        const modes: Record<string, string> = {
+          verbose: 'verbose',
+          detailed: 'verbose',
+          normal: 'normal',
+          compact: 'compact',
+          simple: 'compact',
+        };
+        const v = modes[arg.toLowerCase()];
+        if (!v) {
+          await reply([
+            `当前: ${settings.msgMode}`,
+            '/msgmode <verbose|normal|compact>',
+            '',
+            'verbose - 详细模式: 包含所有中间信息、工具调用',
+            'normal  - 正常模式: 包含中间信息，不含工具调用',
+            'compact - 简洁模式: 仅最终结果 (默认)',
+          ].join('\n'));
+          return true;
+        }
+        this.sessions.update(uid, { msgMode: v as any });
+        const desc: Record<string, string> = {
+          verbose: 'VERBOSE\n显示所有中间输出、工具调用详情',
+          normal: 'NORMAL\n显示中间思考/文本，不含工具调用',
+          compact: 'COMPACT\n仅显示最终结果',
+        };
+        await reply(desc[v]);
         return true;
       }
 
@@ -1029,16 +1060,23 @@ export class Router {
       this.lastResponse.set(uid, { tool: adapter.displayName, text: cleanText });
       this.sessions.update(uid, { defaultTool: toolName });
 
-      // Send thinking content first if enabled
-      if (settings.showThoughts && result.thinking) {
-        log.debug(`[exec] sending thinking content, length: ${result.thinking.length}`);
-        await this.ilink.sendText(uid, `THINKING:\n\n${result.thinking}\n\n---`);
-      } else if (settings.showThoughts) {
-        log.debug(`[exec] showThoughts is ON but no thinking content`);
+      // Handle intermediate messages based on msgMode
+      const msgMode = settings.msgMode || 'compact';
+      if (msgMode !== 'compact' && result.intermediate && result.intermediate.length > 0) {
+        const intermediateText = this.formatIntermediateMessages(result.intermediate, msgMode);
+        if (intermediateText) {
+          await this.ilink.sendText(uid, intermediateText);
+        }
       }
 
-      const sentNotice = sentFiles.length > 0 
-        ? `\n[已发送文件: ${sentFiles.join(', ')}]` 
+      // Send thinking content if enabled (or in verbose mode)
+      if ((settings.showThoughts || msgMode === 'verbose') && result.thinking) {
+        log.debug(`[exec] sending thinking content, length: ${result.thinking.length}`);
+        await this.ilink.sendText(uid, `💭 思考:\n${result.thinking}\n\n---`);
+      }
+
+      const sentNotice = sentFiles.length > 0
+        ? `\n[已发送文件: ${sentFiles.join(', ')}]`
         : '';
 
       await this.ilink.sendText(uid, formatResponse(notice + cleanText + sentNotice, {
@@ -1055,6 +1093,38 @@ export class Router {
       stopTyping();
       this.active.delete(`${uid}:${toolName}`);
     }
+  }
+
+  private formatIntermediateMessages(messages: import('../adapters/base.js').IntermediateMessage[], mode: string): string {
+    const parts: string[] = ['📋 中间过程:'];
+
+    for (const msg of messages) {
+      switch (msg.type) {
+        case 'thinking':
+          if (mode === 'verbose') {
+            parts.push(`\n💭 思考: ${msg.content.substring(0, 200)}${msg.content.length > 200 ? '...' : ''}`);
+          }
+          break;
+        case 'text':
+          if (msg.content.trim()) {
+            parts.push(`\n💬 ${msg.content.substring(0, 300)}${msg.content.length > 300 ? '...' : ''}`);
+          }
+          break;
+        case 'tool_use':
+          if (mode === 'verbose') {
+            parts.push(`\n🔧 调用工具: ${msg.toolName || 'unknown'}`);
+          }
+          break;
+        case 'tool_result':
+          if (mode === 'verbose') {
+            const preview = msg.content.substring(0, 200);
+            parts.push(`\n📤 结果: ${preview}${msg.content.length > 200 ? '...' : ''}`);
+          }
+          break;
+      }
+    }
+
+    return parts.length > 1 ? parts.join('\n') : '';
   }
 
   private async parseAndSendFiles(uid: string, text: string): Promise<{ text: string; sentFiles: string[] }> {
