@@ -26,7 +26,7 @@ function buildMediaPrompt(prompt: string, media?: DownloadedMedia[], workDir?: s
 
 ${fileList}
 
-文件已保存到工作目录，等待您的指令。${userPrompt}`;
+文件已保存到工作目录。请勿主动读取或处理这些文件，等待用户明确指示需要做什么。${userPrompt}`;
 }
 
 export class OpenCodeAdapter implements CLIAdapter {
@@ -45,7 +45,7 @@ export class OpenCodeAdapter implements CLIAdapter {
       const { settings } = opts;
       const workDir = settings.workDir || opts.workDir;
       const fullPrompt = buildMediaPrompt(prompt, opts.media, workDir);
-      const args = ['run', fullPrompt, '--format', 'json', '--thinking'];
+      const args = ['run', '--format', 'json', '--thinking'];
 
       if (settings.workDir || opts.workDir) {
         args.push('--dir', settings.workDir || opts.workDir!);
@@ -70,9 +70,13 @@ export class OpenCodeAdapter implements CLIAdapter {
 
       const proc = spawnProc(this.command, args, {
         cwd: settings.workDir || opts.workDir,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env },
       });
+
+      // 通过 stdin 传递提示词
+      proc.stdin!.write(fullPrompt, 'utf8');
+      proc.stdin!.end();
 
       setupAbort(proc, opts.signal);
       const timer = setupTimeout(proc, opts.timeout);
@@ -85,6 +89,8 @@ export class OpenCodeAdapter implements CLIAdapter {
       proc.on('close', (code) => {
         if (timer) clearTimeout(timer);
         if (opts.signal?.aborted) { resolve({ text: '已取消', error: true }); return; }
+
+        log.debug(`[opencode] stdout length: ${stdout.length}, first 500 chars: ${stdout.substring(0, 500)}`);
 
         try {
           let text = '';
@@ -102,6 +108,7 @@ export class OpenCodeAdapter implements CLIAdapter {
               }
               if (obj.type === 'reasoning' && obj.part?.text) {
                 thinking += obj.part.text;
+                log.debug(`[opencode] found reasoning, length: ${obj.part.text.length}`);
               }
               if (obj.sessionID && !sessionId) {
                 sessionId = obj.sessionID;
@@ -114,6 +121,7 @@ export class OpenCodeAdapter implements CLIAdapter {
             }
           }
 
+          log.debug(`[opencode] final thinking length: ${thinking.length}`);
           if (text) {
             resolve({ text, thinking: thinking || undefined, sessionId, error: hasError });
           } else {

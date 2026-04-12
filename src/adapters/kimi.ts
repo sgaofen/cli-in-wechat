@@ -26,7 +26,7 @@ function buildMediaPrompt(prompt: string, media?: DownloadedMedia[], workDir?: s
 
 ${fileList}
 
-文件已保存到工作目录，等待您的指令。${userPrompt}`;
+文件已保存到工作目录。请勿主动读取或处理这些文件，等待用户明确指示需要做什么。${userPrompt}`;
 }
 
 export class KimiAdapter implements CLIAdapter {

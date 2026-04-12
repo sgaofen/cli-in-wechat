@@ -1031,7 +1031,10 @@ export class Router {
 
       // Send thinking content first if enabled
       if (settings.showThoughts && result.thinking) {
+        log.debug(`[exec] sending thinking content, length: ${result.thinking.length}`);
         await this.ilink.sendText(uid, `THINKING:\n\n${result.thinking}\n\n---`);
+      } else if (settings.showThoughts) {
+        log.debug(`[exec] showThoughts is ON but no thinking content`);
       }
 
       const sentNotice = sentFiles.length > 0 
