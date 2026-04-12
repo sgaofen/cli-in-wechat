@@ -69,7 +69,7 @@ export const DEFAULT_SETTINGS: UserSettings = {
   includeDirs: '',
   extensions: '',
   showThoughts: false,
-  msgMode: 'compact',
+  msgMode: 'normal',
 };
 
 export interface AskUserRequest {

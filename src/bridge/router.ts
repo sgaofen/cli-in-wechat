@@ -1061,7 +1061,7 @@ export class Router {
       this.sessions.update(uid, { defaultTool: toolName });
 
       // Handle intermediate messages based on msgMode
-      const msgMode = settings.msgMode || 'compact';
+      const msgMode = settings.msgMode || 'normal';
       if (msgMode !== 'compact' && result.intermediate && result.intermediate.length > 0) {
         const intermediateText = this.formatIntermediateMessages(result.intermediate, msgMode);
         if (intermediateText) {
@@ -1096,7 +1096,7 @@ export class Router {
   }
 
   private formatIntermediateMessages(messages: import('../adapters/base.js').IntermediateMessage[], mode: string): string {
-    const parts: string[] = ['📋 中间过程:'];
+    const parts: string[] = [];
 
     for (const msg of messages) {
       switch (msg.type) {
@@ -1124,7 +1124,7 @@ export class Router {
       }
     }
 
-    return parts.length > 1 ? parts.join('\n') : '';
+    return parts.length > 0 ? parts.join('\n') : '';
   }
 
   private async parseAndSendFiles(uid: string, text: string): Promise<{ text: string; sentFiles: string[] }> {

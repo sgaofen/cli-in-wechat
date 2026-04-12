@@ -142,12 +142,9 @@ export class ClaudeAdapter implements CLIAdapter {
       const msg = message as Record<string, unknown>;
 
       if (msg.type === 'assistant') {
-        const content = msg.content as Array<{
-          type: string;
-          thinking?: string;
-          text?: string;
-          name?: string;
-        }> | undefined;
+        // SDK 用 message.content 存储 content blocks
+        const msgObj = msg as any;
+        const content = msgObj.content || msgObj.message?.content;
         if (content) {
           for (const block of content) {
             if (block.type === 'thinking' && block.thinking) {
@@ -173,10 +170,9 @@ export class ClaudeAdapter implements CLIAdapter {
       }
 
       if (msg.type === 'user') {
-        const content = msg.content as Array<{
-          type: string;
-          content?: string;
-        }> | undefined;
+        // SDK 用 message.content 存储 tool_result
+        const msgObj = msg as any;
+        const content = msgObj.content || msgObj.message?.content;
         if (content && collectIntermediate) {
           for (const block of content) {
             if (block.type === 'tool_result' && block.content) {
