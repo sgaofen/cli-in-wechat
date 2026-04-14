@@ -16,8 +16,10 @@ import type {
 const CHANNEL_VERSION = '1.0.2';
 const HTTP_TIMEOUT_MS = 45_000;
 const CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
-const SEND_RETRY_DELAYS_MS = [12_000, 30_000] as const;
-const RATE_LIMIT_COOLDOWN_MS = 150_000; // ~2.5 minutes
+const REGULAR_RETRY_DELAYS_MS = [0, 30_000, 60_000, 120_000] as const;
+const INTERMEDIATE_RETRY_DELAYS_MS = [0, 12_000] as const;
+const BASE_RATE_LIMIT_COOLDOWN_MS = 150_000; // ~2.5 minutes
+const MAX_RATE_LIMIT_COOLDOWN_MS = 420_000; // ~7 minutes
 
 // Upload media types
 const UPLOAD_MEDIA_TYPE_IMAGE = 1;
@@ -29,6 +31,7 @@ type SendStreamType = 'regular' | 'intermediate';
 interface UserRateLimitState {
   consecutiveRet2: number;
   suppressIntermediateUntil: number;
+  blockAllSendsUntil: number;
 }
 
 export type MessageHandler = (
@@ -205,7 +208,11 @@ export class ILinkClient {
   }
 
   private getRateLimitState(userId: string): UserRateLimitState {
-    const state = this.rateLimitStates.get(userId) || { consecutiveRet2: 0, suppressIntermediateUntil: 0 };
+    const state = this.rateLimitStates.get(userId) || {
+      consecutiveRet2: 0,
+      suppressIntermediateUntil: 0,
+      blockAllSendsUntil: 0,
+    };
     this.rateLimitStates.set(userId, state);
     return state;
   }
@@ -215,6 +222,34 @@ export class ILinkClient {
     return msg.includes('ret=-2');
   }
 
+  private nextCooldownMs(consecutiveRet2: number): number {
+    // 2nd consecutive ret=-2 => 150s; then linear backoff up to ~7min.
+    const steps = Math.max(0, consecutiveRet2 - 2);
+    return Math.min(MAX_RATE_LIMIT_COOLDOWN_MS, BASE_RATE_LIMIT_COOLDOWN_MS + steps * 60_000);
+  }
+
+  private async gateSendWindow(userId: string, streamType: SendStreamType): Promise<boolean> {
+    const state = this.getRateLimitState(userId);
+    const now = Date.now();
+
+    if (streamType === 'intermediate' && now < state.suppressIntermediateUntil) {
+      log.debug(`[send] 跳过中间消息(保护模式): ${userId.substring(0, 12)}...`);
+      return false;
+    }
+
+    if (now < state.blockAllSendsUntil) {
+      if (streamType === 'intermediate') {
+        log.debug('[send] 中间消息命中全局发送冷却，直接跳过');
+        return false;
+      }
+      const waitMs = state.blockAllSendsUntil - now;
+      log.warn(`[send] 命中限流冷却窗口，延迟发送 ${Math.ceil(waitMs / 1000)}s`);
+      await sleep(waitMs);
+    }
+
+    return true;
+  }
+
   async sendText(userId: string, text: string, options?: { streamType?: SendStreamType }): Promise<void> {
     const token = this.contextTokens.get(userId);
     if (!token) {
@@ -222,11 +257,9 @@ export class ILinkClient {
       return;
     }
     const streamType = options?.streamType || 'regular';
-    const state = this.getRateLimitState(userId);
-    if (streamType === 'intermediate' && Date.now() < state.suppressIntermediateUntil) {
-      log.debug(`[send] 跳过中间消息(保护模式): ${userId.substring(0, 12)}...`);
+    if (!(await this.gateSendWindow(userId, streamType))) {
       return;
-    }
+    }    
 
     await this.enqueueSend(userId, async () => {
       const chunks = chunkText(text, 2000);
@@ -247,21 +280,22 @@ export class ILinkClient {
   ): Promise<void> {
     const state = this.getRateLimitState(userId);
     let lastErr: unknown = null;
-    const maxAttempts = SEND_RETRY_DELAYS_MS.length + 1;
+    const retryDelays = streamType === 'regular'
+      ? REGULAR_RETRY_DELAYS_MS
+      : INTERMEDIATE_RETRY_DELAYS_MS;
 
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      if (attempt > 0) {
-        await sleep(SEND_RETRY_DELAYS_MS[attempt - 1]);
-      }
+    for (let attempt = 0; attempt < retryDelays.length; attempt++) {
+      const delay = retryDelays[attempt];
+      if (delay > 0) await sleep(delay);
 
-      if (streamType === 'intermediate' && Date.now() < state.suppressIntermediateUntil) {
-        log.debug(`[send] 中间消息重试前进入保护模式，放弃本条发送`);
+      if (!(await this.gateSendWindow(userId, streamType))) {
         return;
       }
 
       try {
         await this.sendRawMessage(userId, contextToken, itemList);
         state.consecutiveRet2 = 0;
+        state.blockAllSendsUntil = 0;
         return;
       } catch (err) {
         lastErr = err;
@@ -269,17 +303,17 @@ export class ILinkClient {
 
         if (isRateLimited) {
           state.consecutiveRet2 += 1;
-          if (state.consecutiveRet2 >= 2) {
-            const until = Date.now() + RATE_LIMIT_COOLDOWN_MS;
-            state.suppressIntermediateUntil = Math.max(state.suppressIntermediateUntil, until);
-            log.warn(`[send] 已进入中间消息保护模式，约 ${Math.round(RATE_LIMIT_COOLDOWN_MS / 1000)}s`);
-          }
+          const cooldownMs = this.nextCooldownMs(state.consecutiveRet2);
+          const until = Date.now() + cooldownMs;
+          state.blockAllSendsUntil = Math.max(state.blockAllSendsUntil, until);
+          state.suppressIntermediateUntil = Math.max(state.suppressIntermediateUntil, until);
+          log.warn(`[send] 命中限流 ret=-2，进入冷却 ${Math.round(cooldownMs / 1000)}s (连续${state.consecutiveRet2}次)`);
         }
 
-        if (!isRateLimited || attempt === maxAttempts - 1) {
+        if (!isRateLimited || attempt === retryDelays.length - 1) {
           throw err;
         }
-        log.warn(`[send] 命中速率限制 ret=-2，延迟重试 (${attempt + 1}/${maxAttempts - 1})`);
+        log.warn(`[send] ret=-2 延迟重试 (${attempt + 1}/${retryDelays.length - 1})`);
       }
     }
     throw lastErr instanceof Error ? lastErr : new Error('发送消息失败');
