@@ -23,6 +23,10 @@ const TOOL_ALIASES: Record<string, string> = {
   opencode: 'opencode', oc: 'opencode',
 };
 
+const NORMAL_ACTIVITY_MAX_LINES_PER_MESSAGE = 12;
+const NORMAL_ACTIVITY_MAX_CHARS_PER_MESSAGE = 1400;
+const NORMAL_ACTIVITY_SPLIT_DELAY_MS = 5000;
+
 export class Router {
   private ilink: ILinkClient;
   private registry: AdapterRegistry;
@@ -75,6 +79,77 @@ export class Router {
     const v = (mode || '').toLowerCase();
     if (v === 'verbose' || v === 'normal' || v === 'compact') return v;
     return DEFAULT_SETTINGS.msgMode;
+  }
+
+  private normalizeModelArg(raw: string): string {
+    const trimmed = raw.trim();
+    if (!trimmed) return '';
+
+    const unquoted = trimmed.replace(/^["'“”]+|["'“”]+$/g, '');
+    const lower = unquoted.toLowerCase();
+    if (lower === 'default' || lower === 'reset' || unquoted === '默认' || unquoted === '默认模型') {
+      return '';
+    }
+
+    const noSlashDotTail = unquoted.replace(/(?:\/[.。．])+$/u, '');
+    const normalized = noSlashDotTail.replace(/[。．.!！?？,，;；、]+$/u, '').trim();
+    const finalModel = normalized || noSlashDotTail;
+    const finalLower = finalModel.toLowerCase();
+
+    if (!finalModel || finalLower === 'default' || finalLower === 'reset' || finalModel === '默认' || finalModel === '默认模型') {
+      return '';
+    }
+
+    return finalModel;
+  }
+
+  private splitNormalActivityLines(lines: string[]): string[][] {
+    if (lines.length === 0) return [];
+
+    const singlePayloadLength = ['Activity', ...lines].join('\n').length;
+    if (lines.length <= NORMAL_ACTIVITY_MAX_LINES_PER_MESSAGE && singlePayloadLength <= NORMAL_ACTIVITY_MAX_CHARS_PER_MESSAGE) {
+      return [lines.slice()];
+    }
+
+    const batches: string[][] = [];
+    let current: string[] = [];
+    let currentLen = 'Activity'.length;
+
+    const flushCurrent = () => {
+      if (current.length === 0) return;
+      batches.push(current);
+      current = [];
+      currentLen = 'Activity'.length;
+    };
+
+    for (const line of lines) {
+      const nextLen = currentLen + 1 + line.length;
+      const exceedLineLimit = current.length >= NORMAL_ACTIVITY_MAX_LINES_PER_MESSAGE;
+      const exceedCharLimit = nextLen > NORMAL_ACTIVITY_MAX_CHARS_PER_MESSAGE;
+      if (current.length > 0 && (exceedLineLimit || exceedCharLimit)) flushCurrent();
+
+      current.push(line);
+      currentLen += 1 + line.length;
+    }
+
+    flushCurrent();
+    return batches;
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private async sendNormalActivityBatches(uid: string, lines: string[]): Promise<boolean> {
+    const batches = this.splitNormalActivityLines(lines);
+    if (batches.length <= 1) return false;
+
+    for (let i = 0; i < batches.length; i++) {
+      const title = `Activity (${i + 1}/${batches.length})`;
+      await this.ilink.sendText(uid, [title, ...batches[i]].join('\n'));
+      if (i < batches.length - 1) await this.sleep(NORMAL_ACTIVITY_SPLIT_DELAY_MS);
+    }
+    return true;
   }
 
 
@@ -291,12 +366,13 @@ export class Router {
       }
 
       case 'model': case 'm':
-        if (!arg || arg === 'reset' || arg === 'default') {
+        const model = this.normalizeModelArg(arg);
+        if (!model) {
           this.sessions.update(uid, { model: '' });
           await reply('model → 默认');
         } else {
-          this.sessions.update(uid, { model: arg });
-          await reply(`model → ${arg}`);
+          this.sessions.update(uid, { model });
+          await reply(`model → ${model}`);
         }
         return true;
 
@@ -1222,7 +1298,11 @@ export class Router {
         ? `\n[已发送文件: ${sentFiles.join(', ')}]`
         : '';
 
-      const finalActivityBlock = msgMode === 'normal' && finalActivityLines.length > 0
+      const splitActivitySent = msgMode === 'normal' && finalActivityLines.length > 0
+        ? await this.sendNormalActivityBatches(uid, finalActivityLines)
+        : false;
+
+      const finalActivityBlock = msgMode === 'normal' && finalActivityLines.length > 0 && !splitActivitySent
         ? `Activity\n${finalActivityLines.join('\n')}\n\n`
         : '';
 

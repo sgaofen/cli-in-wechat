@@ -144,3 +144,68 @@ test('handle() omits refText in combined prompt if refText is empty', async () =
 
   assert.equal(capturedPrompt, 'explain');
 });
+
+test('handleSlash /model strips accidental /. suffix from model name', async () => {
+  const { router, sessions, messages } = createRouter();
+
+  await router.handleSlash('u1', '/model glm-5/.');
+
+  assert.equal((sessions.get('u1') as any).model, 'glm-5');
+  assert.equal(messages[messages.length - 1]?.text, 'model → glm-5');
+});
+
+test('handleSlash /model 默认 resets model only', async () => {
+  const { router, sessions, messages } = createRouter();
+  sessions.update('u1', { model: 'glm-5', effort: 'low', mode: 'safe' } as any);
+
+  await router.handleSlash('u1', '/model 默认');
+
+  const settings = sessions.get('u1') as any;
+  assert.equal(settings.model, '');
+  assert.equal(settings.effort, 'low');
+  assert.equal(settings.mode, 'safe');
+  assert.equal(messages[messages.length - 1]?.text, 'model → 默认');
+});
+
+test('splitNormalActivityLines keeps single batch when within boundary', () => {
+  const { router } = createRouter();
+  const lines = [
+    '- Skill: directory-list',
+    '- Shell Command: dir "C:\\tmp\\demo"',
+    '- Shell Command: ls -la',
+  ];
+
+  const batches = (router as any).splitNormalActivityLines(lines);
+
+  assert.equal(Array.isArray(batches), true);
+  assert.equal(batches.length, 1);
+  assert.deepEqual(batches[0], lines);
+});
+
+test('splitNormalActivityLines splits oversized activity into multiple batches', () => {
+  const { router } = createRouter();
+  const lines = Array.from({ length: 18 }, (_, i) => `- Shell Command: very long command ${i + 1} ${'x'.repeat(80)}`);
+
+  const batches = (router as any).splitNormalActivityLines(lines);
+
+  assert.ok(batches.length > 1);
+  assert.deepEqual(batches.flat(), lines);
+  for (const batch of batches) {
+    assert.ok(batch.length > 0);
+  }
+});
+
+test('sendNormalActivityBatches waits 5 seconds between oversized batches', async () => {
+  const { router, messages } = createRouter();
+  const lines = Array.from({ length: 20 }, (_, i) => `- Shell Command: item ${i + 1} ${'y'.repeat(90)}`);
+  const delays: number[] = [];
+  (router as any).sleep = async (ms: number) => {
+    delays.push(ms);
+  };
+
+  await (router as any).sendNormalActivityBatches('u1', lines);
+
+  const activityMessages = messages.filter((m) => m.text.startsWith('Activity'));
+  assert.ok(activityMessages.length > 1);
+  assert.deepEqual(delays, Array(activityMessages.length - 1).fill(5000));
+});
