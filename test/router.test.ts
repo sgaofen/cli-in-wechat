@@ -209,3 +209,45 @@ test('sendNormalActivityBatches waits 5 seconds between oversized batches', asyn
   assert.ok(activityMessages.length > 1);
   assert.deepEqual(delays, Array(activityMessages.length - 1).fill(5000));
 });
+
+test('exec sanitizes stale malformed model before adapter execution', async () => {
+  const { router, sessions } = createRouter();
+  const capturedModels: string[] = [];
+
+  (router as any).registry.get = (_name: string) => ({
+    name: 'opencode',
+    displayName: 'OpenCode',
+    capabilities: { sessionResume: false },
+    execute: async (_prompt: string, opts: any) => {
+      capturedModels.push(opts.settings.model);
+      return { text: 'ok', error: false };
+    },
+  });
+
+  sessions.update('u1', { model: 'glm-5/.' } as any);
+  await router.exec('u1', 'opencode', 'hello');
+
+  assert.equal(capturedModels[0], 'glm-5');
+  assert.equal((sessions.get('u1') as any).model, 'glm-5');
+});
+
+test('exec maps stale default-alias model to empty before adapter execution', async () => {
+  const { router, sessions } = createRouter();
+  const capturedModels: string[] = [];
+
+  (router as any).registry.get = (_name: string) => ({
+    name: 'opencode',
+    displayName: 'OpenCode',
+    capabilities: { sessionResume: false },
+    execute: async (_prompt: string, opts: any) => {
+      capturedModels.push(opts.settings.model);
+      return { text: 'ok', error: false };
+    },
+  });
+
+  sessions.update('u1', { model: '默认/.' } as any);
+  await router.exec('u1', 'opencode', 'hello');
+
+  assert.equal(capturedModels[0], '');
+  assert.equal((sessions.get('u1') as any).model, '');
+});

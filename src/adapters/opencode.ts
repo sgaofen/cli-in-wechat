@@ -3,6 +3,26 @@ import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from '.
 import { commandExists, spawnProc, setupAbort, setupTimeout, stripAnsi } from './base.js';
 import type { DownloadedMedia } from '../utils/media.js';
 import { copyMediaToWorkDir } from '../utils/media.js';
+import { execSync } from 'node:child_process';
+
+const modelResolveCache = new Map<string, string>();
+
+export function resolveBareModelFromList(model: string, availableModels: string[]): string {
+  const raw = model.trim();
+  if (!raw || raw.includes('/')) return raw;
+
+  const suffix = `/${raw.toLowerCase()}`;
+  const matches = availableModels
+    .map((item) => item.trim())
+    .filter((item) => item.includes('/'))
+    .filter((item) => item.toLowerCase().endsWith(suffix));
+
+  if (matches.length === 1) return matches[0];
+  if (matches.length === 0) return raw;
+
+  const preferred = matches.find((item) => /baiduqianfancodingplan/i.test(item));
+  return preferred || raw;
+}
 
 function buildMediaPrompt(prompt: string, media?: DownloadedMedia[], workDir?: string): string {
   if (!media || media.length === 0) return prompt;
@@ -40,6 +60,36 @@ export class OpenCodeAdapter implements CLIAdapter {
 
   async isAvailable(): Promise<boolean> { return commandExists(this.command); }
 
+  private resolveModelArg(model: string, workDir?: string): string {
+    const raw = model.trim();
+    if (!raw || raw.includes('/')) return raw;
+
+    const key = raw.toLowerCase();
+    const cached = modelResolveCache.get(key);
+    if (cached) return cached;
+
+    try {
+      const output = execSync('opencode models', {
+        cwd: workDir,
+        encoding: 'utf8',
+        timeout: 5000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const availableModels = output
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+      const resolved = resolveBareModelFromList(raw, availableModels);
+      modelResolveCache.set(key, resolved);
+      if (resolved !== raw) {
+        log.debug(`[opencode] model alias resolved: ${raw} -> ${resolved}`);
+      }
+      return resolved;
+    } catch {
+      return raw;
+    }
+  }
+
   execute(prompt: string, opts: ExecOptions): Promise<ExecResult> {
     return new Promise((resolve) => {
       const { settings } = opts;
@@ -56,7 +106,8 @@ export class OpenCodeAdapter implements CLIAdapter {
       }
 
       if (settings.model) {
-        args.push('-m', settings.model);
+        const resolvedModel = this.resolveModelArg(settings.model, settings.workDir || opts.workDir);
+        args.push('-m', resolvedModel);
       }
 
       const sid = settings.sessionIds[this.name];

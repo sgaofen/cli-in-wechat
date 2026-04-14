@@ -1082,7 +1082,13 @@ export class Router {
   ): Promise<{ result: import('../adapters/base.js').ExecResult; notice: string }> {
     const adapter = this.registry.get(toolName)!;
     const extraArgs = this.config.tools[toolName]?.args;
-    const hadSession = adapter.capabilities.sessionResume && !!this.sessions.get(uid).sessionIds[toolName];
+    const initialSettings = this.sessions.get(uid);
+    const normalizedModel = this.normalizeModelArg(initialSettings.model || '');
+    if (normalizedModel !== initialSettings.model) {
+      this.sessions.update(uid, { model: normalizedModel });
+    }
+    const settings = this.sessions.get(uid);
+    const hadSession = adapter.capabilities.sessionResume && !!settings.sessionIds[toolName];
 
     if (signal.aborted) return { result: { text: '已取消', error: true }, notice: '' };
 
@@ -1091,7 +1097,7 @@ export class Router {
     const enhancedPrompt = prompt + sendFileHint;
 
     const result = await adapter.execute(enhancedPrompt, {
-      settings: this.sessions.get(uid), workDir: this.config.workDir, timeout: this.config.cliTimeout, extraArgs, signal,
+      settings, workDir: this.config.workDir, timeout: this.config.cliTimeout, extraArgs, signal,
       askUser: (req) => this.askUserViaWeChat(uid, toolName, req),
       media,
       onIntermediate,
