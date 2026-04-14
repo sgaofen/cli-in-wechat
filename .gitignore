@@ -19,3 +19,6 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+# Local change notes
+CHANGES.md
