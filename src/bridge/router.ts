@@ -91,7 +91,8 @@ export class Router {
       return '';
     }
 
-    const noSlashDotTail = unquoted.replace(/(?:\/[.。．])+$/u, '');
+const noTrailingSlash = unquoted.replace(/\/+$/, '');
+    const noSlashDotTail = noTrailingSlash.replace(/(?:\/[.。．])+$/u, '');
     const normalized = noSlashDotTail.replace(/[。．.!！?？,，;；、]+$/u, '').trim();
     const finalModel = normalized || noSlashDotTail;
     const finalLower = finalModel.toLowerCase();

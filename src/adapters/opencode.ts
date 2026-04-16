@@ -8,7 +8,7 @@ import { execSync } from 'node:child_process';
 const modelResolveCache = new Map<string, string>();
 
 export function resolveBareModelFromList(model: string, availableModels: string[]): string {
-  const raw = model.trim();
+  const raw = model.trim().replace(/\/+$/, '');
   if (!raw || raw.includes('/')) return raw;
 
   const suffix = `/${raw.toLowerCase()}`;
@@ -60,8 +60,8 @@ export class OpenCodeAdapter implements CLIAdapter {
 
   async isAvailable(): Promise<boolean> { return commandExists(this.command); }
 
-  private resolveModelArg(model: string, workDir?: string): string {
-    const raw = model.trim();
+private resolveModelArg(model: string, workDir?: string): string {
+    const raw = model.trim().replace(/\/+$/, '');
     if (!raw || raw.includes('/')) return raw;
 
     const key = raw.toLowerCase();
@@ -80,12 +80,15 @@ export class OpenCodeAdapter implements CLIAdapter {
         .map((line) => line.trim())
         .filter(Boolean);
       const resolved = resolveBareModelFromList(raw, availableModels);
-      modelResolveCache.set(key, resolved);
       if (resolved !== raw) {
+        modelResolveCache.set(key, resolved);
         log.debug(`[opencode] model alias resolved: ${raw} -> ${resolved}`);
+        return resolved;
       }
-      return resolved;
-    } catch {
+      log.warn(`[opencode] model not found in available models: ${raw}, tried: ${availableModels.slice(0, 10).join(', ')}`);
+      return raw;
+    } catch (err) {
+      log.warn(`[opencode] models command failed: ${(err as Error).message}`);
       return raw;
     }
   }

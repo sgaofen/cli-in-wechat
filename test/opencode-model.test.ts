@@ -32,3 +32,21 @@ test('resolveBareModelFromList prefers baiduqianfancodingplan when ambiguous', (
   ]);
   assert.equal(model, 'baiduqianfancodingplan/glm-5');
 });
+
+test('resolveBareModelFromList strips trailing slash', () => {
+  const model = resolveBareModelFromList('minimax-m2.5-free/', []);
+  assert.equal(model, 'minimax-m2.5-free');
+});
+
+test('resolveBareModelFromList strips multiple trailing slashes', () => {
+  const model = resolveBareModelFromList('glm-5///', []);
+  assert.equal(model, 'glm-5');
+});
+
+test('resolveBareModelFromList resolves bare model after stripping trailing slash', () => {
+  const model = resolveBareModelFromList('glm-5/', [
+    'opencode/gpt-5-nano',
+    'baiduqianfancodingplan/glm-5',
+  ]);
+  assert.equal(model, 'baiduqianfancodingplan/glm-5');
+});
