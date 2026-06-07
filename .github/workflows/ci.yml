@@ -30,8 +30,11 @@ jobs:
         run: npm run build
 
       - name: Run unit tests
+        # Invoke node directly under bash so the shell expands test/*.test.ts on every OS.
+        # Going through `npm test` re-spawns via cmd.exe on Windows (no globbing), and
+        # Node 18's --test (unlike Node 21+) can't glob itself -> "Could not find test/*.test.ts".
         shell: bash
-        run: npm test
+        run: node --import tsx --test test/*.test.ts
 
       - name: Test module loading
         run: node -e "import('./dist/adapters/registry.js').then(m => { const r = new m.AdapterRegistry(); console.log('Registry OK, adapters:', r.getAll().map(a => a.name).join(', ')); })"
