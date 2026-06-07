@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { generateWechatUin } from '../utils/crypto.js';
+import { fetchWithRetry } from '../utils/http.js';
 import { loadCredentials, loadContextTokens } from '../config.js';
 import type { Credentials } from '../ilink/types.js';
 
@@ -82,9 +83,12 @@ async function sendRawMessage(
   contextToken: string,
   text: string,
 ): Promise<void> {
-  const res = await fetch(
+  const res = await fetchWithRetry(
     `${credentials.baseUrl}/ilink/bot/sendmessage`,
     {
+      label: 'cli-send',
+      retries: 2,
+      timeoutMs: 30_000,
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

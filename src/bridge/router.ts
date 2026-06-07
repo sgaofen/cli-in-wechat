@@ -50,6 +50,20 @@ export class Router {
     });
   }
 
+  /** Abort every in-flight CLI task and cancel pending questions — called on shutdown so
+   *  spawned children get a SIGTERM/taskkill instead of being orphaned. */
+  stop(): void {
+    const seen = new Set<AbortController>();
+    for (const task of this.active.values()) {
+      if (!seen.has(task.abort)) { seen.add(task.abort); task.abort.abort(); }
+    }
+    this.active.clear();
+    for (const pending of this.pendingQuestions.values()) {
+      clearTimeout(pending.timeout);
+    }
+    this.pendingQuestions.clear();
+  }
+
   private resolveToolFromRefText(refText: string): string | undefined {
     // Parse tool from footer: "— DisplayName | ..."
     const footerMatch = refText.match(/— ([^\|\n]+?)(?:\s*\||\s*$)/m);
@@ -463,10 +477,14 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         }
         return true;
 
-      case 'verbose': case 'v':
-        this.sessions.update(uid, { verbose: !settings.verbose });
-        await reply(`verbose(Kimi CLI) → ${!settings.verbose ? 'ON' : 'OFF'}`);
+      case 'verbose': case 'v': {
+        // Capture the new value first: update() mutates the live `settings` object,
+        // so reading settings.verbose after update() would report the opposite state.
+        const v = !settings.verbose;
+        this.sessions.update(uid, { verbose: v });
+        await reply(`verbose(Kimi CLI) → ${v ? 'ON' : 'OFF'}`);
         return true;
+      }
 
       // ═══════════════════════════════════════════
       // Codex
@@ -486,15 +504,19 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         return true;
       }
 
-      case 'search':
-        this.sessions.update(uid, { search: !settings.search });
-        await reply(`search → ${!settings.search ? 'ON' : 'OFF'}`);
+      case 'search': {
+        const v = !settings.search;
+        this.sessions.update(uid, { search: v });
+        await reply(`search → ${v ? 'ON' : 'OFF'}`);
         return true;
+      }
 
-      case 'ephemeral':
-        this.sessions.update(uid, { ephemeral: !settings.ephemeral });
-        await reply(`ephemeral → ${!settings.ephemeral ? 'ON' : 'OFF'}`);
+      case 'ephemeral': {
+        const v = !settings.ephemeral;
+        this.sessions.update(uid, { ephemeral: v });
+        await reply(`ephemeral → ${v ? 'ON' : 'OFF'}`);
         return true;
+      }
 
       case 'profile':
         if (!arg) { await reply(`当前: ${settings.profile || '无'}\n/profile <名称> 或 /profile reset`); return true; }
@@ -507,8 +529,9 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       // ═══════════════════════════════════════════
 
       case 'thinking': {
-        this.sessions.update(uid, { thinking: !settings.thinking });
-        await reply(`thinking → ${!settings.thinking ? 'ON (深度思考)' : 'OFF'}`);
+        const v = !settings.thinking;
+        this.sessions.update(uid, { thinking: v });
+        await reply(`thinking → ${v ? 'ON (深度思考)' : 'OFF'}`);
         return true;
       }
 
@@ -645,10 +668,12 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       // Claude 额外
       // ═══════════════════════════════════════════
 
-      case 'bare':
-        this.sessions.update(uid, { bare: !settings.bare } as any);
-        await reply(`bare → ${!(settings as any).bare ? 'ON (跳过配置加载)' : 'OFF'}`);
+      case 'bare': {
+        const v = !settings.bare;
+        this.sessions.update(uid, { bare: v } as any);
+        await reply(`bare → ${v ? 'ON (跳过配置加载)' : 'OFF'}`);
         return true;
+      }
 
       case 'adddir': case 'add-dir':
         if (!arg) { await reply(`当前: ${(settings as any).addDir || '无'}\n/adddir <路径>`); return true; }

@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { log } from '../utils/logger.js';
-import type { DownloadedMedia } from '../utils/media.js';
+import { copyMediaToWorkDir, type DownloadedMedia } from '../utils/media.js';
 
 export type ToolMode = 'auto' | 'safe' | 'plan';
 export type MsgMode = 'verbose' | 'normal' | 'compact';
@@ -146,13 +146,75 @@ export function commandExists(cmd: string): Promise<boolean> {
   return new Promise((resolve) => { const proc = spawn(checker, [cmd], { stdio: 'pipe' }); proc.on('close', (code) => resolve(code === 0)); proc.on('error', () => resolve(false)); });
 }
 
+/** Terminate a spawned process. On Windows, spawnProc uses shell:true (cmd.exe wrapper),
+ *  so proc.kill() only reaps cmd.exe and orphans the real CLI child — use taskkill /T to
+ *  kill the whole tree. On POSIX a SIGTERM to the child is sufficient. */
+export function killProc(proc: ChildProcess): void {
+  if (proc.killed || proc.exitCode !== null) return;
+  if (WIN && proc.pid) {
+    try {
+      const killer = spawn('taskkill', ['/pid', String(proc.pid), '/T', '/F'], { stdio: 'ignore' });
+      killer.on('error', () => { try { proc.kill('SIGKILL'); } catch { /* ignore */ } });
+      return;
+    } catch { /* fall through to proc.kill */ }
+  }
+  try { proc.kill('SIGTERM'); } catch { /* already gone */ }
+}
+
 export function setupAbort(proc: ChildProcess, signal?: AbortSignal): void {
-  if (!signal) return; if (signal.aborted) { proc.kill('SIGTERM'); return; }
-  const onAbort = () => proc.kill('SIGTERM'); signal.addEventListener('abort', onAbort, { once: true }); proc.on('close', () => signal.removeEventListener('abort', onAbort));
+  if (!signal) return; if (signal.aborted) { killProc(proc); return; }
+  const onAbort = () => killProc(proc); signal.addEventListener('abort', onAbort, { once: true }); proc.on('close', () => signal.removeEventListener('abort', onAbort));
 }
 
 export function setupTimeout(proc: ChildProcess, timeout?: number): ReturnType<typeof setTimeout> | null {
-  if (!timeout) return null; return setTimeout(() => proc.kill('SIGTERM'), timeout);
+  if (!timeout) return null; return setTimeout(() => killProc(proc), timeout);
+}
+
+/** Attach a UTF-8 string decoder to a child's stdout/stderr so multibyte characters
+ *  (Chinese/emoji) are never split across data chunks and mangled into U+FFFD. */
+export function collectUtf8(proc: ChildProcess): { stdout: () => string; stderr: () => string } {
+  let out = '', err = '';
+  proc.stdout?.setEncoding('utf8');
+  proc.stderr?.setEncoding('utf8');
+  proc.stdout?.on('data', (c: string) => { out += c; });
+  proc.stderr?.on('data', (c: string) => { err += c; });
+  return { stdout: () => out, stderr: () => err };
+}
+
+/** Write a prompt to a child's stdin, swallowing the benign EPIPE that occurs if the
+ *  child closes stdin before we finish writing (otherwise it crashes the whole bridge). */
+export function writeStdin(proc: ChildProcess, data: string): void {
+  if (!proc.stdin) return;
+  proc.stdin.on('error', (e) => log.debug('[spawn] stdin write error (ignored):', (e as Error).message));
+  proc.stdin.write(data, 'utf8');
+  proc.stdin.end();
+}
+
+/** Shared media-prompt builder. Previously duplicated verbatim across all five adapters,
+ *  which forced multi-file edits for a single wording change (commit 9c84af6). */
+export function buildMediaPrompt(prompt: string, media?: DownloadedMedia[], workDir?: string): string {
+  if (!media || media.length === 0) return prompt;
+
+  const copiedMedia = workDir ? media.map((m) => copyMediaToWorkDir(m, workDir)) : media;
+
+  const fileList = copiedMedia.map((m) => {
+    const relativePath = workDir && m.path.startsWith(workDir)
+      ? m.path.slice(workDir.length).replace(/^[/\\]/, '')
+      : m.path;
+    const typeNames: Record<string, string> = { image: '图片', file: '文件', video: '视频' };
+    const sizeStr = m.size ? `${(m.size / 1024).toFixed(1)}KB` : '未知大小';
+    return `- ${m.fileName}\n  类型: ${typeNames[m.type] || '文件'}\n  大小: ${sizeStr}\n  路径: ${relativePath}`;
+  }).join('\n\n');
+
+  const userPrompt = prompt.trim() && !prompt.startsWith('[文件:') && !prompt.startsWith('[图片:') && !prompt.startsWith('[视频:')
+    ? `\n\n用户说：${prompt}`
+    : '';
+
+  return `已接收到用户通过微信发送的文件：
+
+${fileList}
+
+文件已保存到工作目录。请勿主动读取或处理这些文件，等待用户明确指示需要做什么。${userPrompt}`;
 }
 
 export function stripAnsi(str: string): string {

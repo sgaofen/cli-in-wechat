@@ -1,7 +1,26 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, chmodSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import type { Credentials } from './ilink/types.js';
+
+/**
+ * Write a file atomically: write to a sibling temp file (same directory, so rename is a
+ * cheap inode swap on the same filesystem) then rename over the target. A crash mid-write
+ * can never leave a half-written config/credentials/sessions file that fails to parse.
+ * The mode is set on the temp file because rename replaces the inode (perms are not inherited).
+ */
+export function atomicWrite(filePath: string, data: string, mode = 0o600): void {
+  const tmp = `${filePath}.${process.pid}.tmp`;
+  writeFileSync(tmp, data, { mode });
+  // rename is atomic on the same filesystem; fall back to a direct write only if it fails
+  // (e.g. an exotic FS that disallows rename-over), accepting the small non-atomic window.
+  try {
+    renameSync(tmp, filePath);
+  } catch {
+    writeFileSync(filePath, data, { mode });
+    try { unlinkSync(tmp); } catch { /* best-effort: don't leave a stale .tmp orphan */ }
+  }
+}
 
 const DATA_DIR = join(homedir(), '.wx-ai-bridge');
 const CONFIG_FILE = join(DATA_DIR, 'config.json');
@@ -38,6 +57,12 @@ const DEFAULT_CONFIG: BridgeConfig = {
 export function ensureDataDir(): void {
   mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
   mkdirSync(SESSIONS_DIR, { recursive: true, mode: 0o700 });
+  // mkdirSync's mode is ignored when the dir already exists (and on Windows); repair it so
+  // an already-present ~/.wx-ai-bridge (holding credentials) is not world-readable.
+  try {
+    chmodSync(DATA_DIR, 0o700);
+    chmodSync(SESSIONS_DIR, 0o700);
+  } catch { /* chmod is a no-op / unsupported on Windows; ignore */ }
 }
 
 export function loadConfig(): BridgeConfig {
@@ -53,7 +78,7 @@ export function loadConfig(): BridgeConfig {
 
 export function saveConfig(config: BridgeConfig): void {
   ensureDataDir();
-  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), { mode: 0o600 });
+  atomicWrite(CONFIG_FILE, JSON.stringify(config, null, 2));
 }
 
 export function loadCredentials(): Credentials | null {
@@ -69,12 +94,12 @@ export function loadCredentials(): Credentials | null {
 
 export function saveCredentials(creds: Credentials): void {
   ensureDataDir();
-  writeFileSync(CREDENTIALS_FILE, JSON.stringify(creds, null, 2), { mode: 0o600 });
+  atomicWrite(CREDENTIALS_FILE, JSON.stringify(creds, null, 2));
 }
 
 export function clearCredentials(): void {
   if (existsSync(CREDENTIALS_FILE)) {
-    writeFileSync(CREDENTIALS_FILE, '{}', { mode: 0o600 });
+    atomicWrite(CREDENTIALS_FILE, '{}');
   }
 }
 
@@ -89,16 +114,14 @@ export function loadPollCursor(): string {
 
 export function savePollCursor(cursor: string): void {
   ensureDataDir();
-  writeFileSync(POLL_CURSOR_FILE, cursor, { mode: 0o600 });
+  atomicWrite(POLL_CURSOR_FILE, cursor);
 }
 
 export function saveContextTokens(tokens: Map<string, string>): void {
   ensureDataDir();
   const obj: Record<string, string> = {};
   for (const [k, v] of tokens) obj[k] = v;
-  const tmp = CONTEXT_TOKENS_FILE + '.tmp';
-  writeFileSync(tmp, JSON.stringify(obj, null, 2), { mode: 0o600 });
-  renameSync(tmp, CONTEXT_TOKENS_FILE);
+  atomicWrite(CONTEXT_TOKENS_FILE, JSON.stringify(obj, null, 2));
 }
 
 export function loadContextTokens(): Map<string, string> {

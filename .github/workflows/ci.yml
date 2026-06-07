@@ -29,6 +29,10 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Run unit tests
+        shell: bash
+        run: npm test
+
       - name: Test module loading
         run: node -e "import('./dist/adapters/registry.js').then(m => { const r = new m.AdapterRegistry(); console.log('Registry OK, adapters:', r.getAll().map(a => a.name).join(', ')); })"
 

@@ -197,12 +197,35 @@ Claude Code 需要你做选择时，问题自动转发到微信：
   "defaultTool": "claude",
   "workDir": "/Users/you",
   "cliTimeout": 300000,
-  "allowedUsers": [],
+  "allowedUsers": [],        // 见下方「安全」说明，留空 = 任何人可控制
   "tools": {
     "claude": { "args": ["--max-turns", "50"] }
   }
 }
 ```
+
+> **安全：`allowedUsers` 留空意味着任何能私聊机器人的微信好友都能以完整权限运行 CLI。**
+> 建议填入你自己的 `ilink_user_id`（启动日志会提示）。
+
+## 网络与代理（故障排查）
+
+所有对微信接口的请求都带 **超时 + 指数退避抖动重试 + 可读诊断**。瞬时网络抖动
+（如 `read ECONNRESET`、`fetch failed`）会被自动重试吞掉，不再像以前那样启动即崩
+（[issue #18](https://github.com/sgaofen/cli-in-wechat/issues/18)）。
+
+- **代理**：Node 的全局 `fetch` 默认不读代理环境变量。若你需要走代理访问微信，
+  设置 `HTTPS_PROXY`（或 `HTTP_PROXY` / `ALL_PROXY`）并安装可选依赖 `undici`：
+
+  ```bash
+  npm i undici                 # 启用代理支持（可选依赖）
+  export HTTPS_PROXY=http://127.0.0.1:7890
+  npm run dev
+  ```
+
+- **仍然 `ECONNRESET` / `fetch failed`**：确认本机可访问 `ilinkai.weixin.qq.com`；
+  尝试关闭/更换代理或 VPN；用 `npm run dev:debug` 查看带诊断的日志。
+- **会话过期自动重登**：token 失效（errcode -14/-13）时会自动重新出示 QR 码重登，
+  而不是直接退出。
 
 ## 架构
 
@@ -219,15 +242,20 @@ src/
 │   ├── claude.ts         # Agent SDK + CLI 降级
 │   ├── codex.ts          # codex exec + stdin 传参
 │   ├── gemini.ts         # gemini -p + stdin 传参
-│   ├── kimi.ts           # kimi --print + --thinking
+│   ├── kimi.ts           # kimi --print + stdin 传参 (避免 shell 注入)
 │   ├── opencode.ts       # opencode -p -f json
 │   └── registry.ts       # 自动检测已安装工具
-└── bridge/               # 桥接逻辑
-    ├── session.ts        # 会话持久化
-    ├── formatter.ts      # 响应格式化
-    └── router.ts         # @ 路由 + / 命令 + >> 接力 + 链式调用
-                          # + /resume 历史会话浏览
-                          # + AskUserQuestion 微信转发
+├── bridge/               # 桥接逻辑
+│   ├── session.ts        # 会话持久化 (原子写)
+│   ├── formatter.ts      # 响应格式化
+│   └── router.ts         # @ 路由 + / 命令 + >> 接力 + 链式调用
+│                         # + /resume 历史会话浏览
+│                         # + AskUserQuestion 微信转发
+└── utils/               # 工具库
+    ├── http.ts           # 带超时/重试/代理的 fetch (issue #18)
+    ├── media.ts          # 媒体下载 + AES 解密 + 文件名净化
+    ├── crypto.ts         # AES-ECB / 签名工具
+    └── logger.ts         # 分级日志
 ```
 
 ## 微信 iLink Bot API
