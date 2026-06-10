@@ -1,11 +1,15 @@
 import { log } from '../utils/logger.js';
+import { fetchWithRetry } from '../utils/http.js';
 import type { Credentials, QRCodeResponse, QRCodeStatusResponse } from './types.js';
 
 const DEFAULT_BASE_URL = 'https://ilinkai.weixin.qq.com';
 
 export async function getQRCode(): Promise<QRCodeResponse> {
-  const res = await fetch(
+  // This is the first network call on startup and the exact crash site of issue #18:
+  // a transient `read ECONNRESET` here used to take down the whole process. Retry hard.
+  const res = await fetchWithRetry(
     `${DEFAULT_BASE_URL}/ilink/bot/get_bot_qrcode?bot_type=3`,
+    { label: 'QR', retries: 4, retryOnHttpError: true, timeoutMs: 20_000 },
   );
   if (!res.ok) throw new Error(`获取二维码失败: HTTP ${res.status}`);
   return res.json() as Promise<QRCodeResponse>;
@@ -14,9 +18,10 @@ export async function getQRCode(): Promise<QRCodeResponse> {
 export async function pollQRCodeStatus(
   qrcode: string,
 ): Promise<QRCodeStatusResponse> {
-  const res = await fetch(
+  // Polled every 2s in a loop, so keep retries light — the loop itself is the outer retry.
+  const res = await fetchWithRetry(
     `${DEFAULT_BASE_URL}/ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qrcode)}`,
-    { headers: { 'iLink-App-ClientVersion': '1' } },
+    { headers: { 'iLink-App-ClientVersion': '1' }, label: 'QR-status', retries: 1, timeoutMs: 15_000 },
   );
   if (!res.ok) throw new Error(`轮询二维码状态失败: HTTP ${res.status}`);
   return res.json() as Promise<QRCodeStatusResponse>;

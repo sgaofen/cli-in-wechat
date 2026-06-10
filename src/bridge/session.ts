@@ -1,6 +1,6 @@
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { getSessionsDir } from '../config.js';
+import { getSessionsDir, atomicWrite } from '../config.js';
 import { DEFAULT_SETTINGS, type UserSettings } from '../adapters/base.js';
 
 export class SessionManager {
@@ -61,7 +61,7 @@ export class SessionManager {
     const out: Record<string, UserSettings> = {};
     for (const [k, v] of this.data) out[k] = v;
     try {
-      writeFileSync(this.filePath(), JSON.stringify(out, null, 2), { mode: 0o600 });
+      atomicWrite(this.filePath(), JSON.stringify(out, null, 2));
     } catch { /* ignore */ }
   }
 }

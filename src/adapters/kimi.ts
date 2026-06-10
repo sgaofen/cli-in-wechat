@@ -1,33 +1,6 @@
 import { log } from '../utils/logger.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
-import { commandExists, spawnProc, setupAbort, setupTimeout, stripAnsi } from './base.js';
-import type { DownloadedMedia } from '../utils/media.js';
-import { copyMediaToWorkDir } from '../utils/media.js';
-
-function buildMediaPrompt(prompt: string, media?: DownloadedMedia[], workDir?: string): string {
-  if (!media || media.length === 0) return prompt;
-  
-  const copiedMedia = workDir ? media.map(m => copyMediaToWorkDir(m, workDir)) : media;
-  
-  const fileList = copiedMedia.map(m => {
-    const relativePath = workDir && m.path.startsWith(workDir) 
-      ? m.path.slice(workDir.length).replace(/^[\/\\]/, '')
-      : m.path;
-    const typeNames: Record<string, string> = { image: '图片', file: '文件', video: '视频' };
-    const sizeStr = m.size ? `${(m.size / 1024).toFixed(1)}KB` : '未知大小';
-    return `- ${m.fileName}\n  类型: ${typeNames[m.type] || '文件'}\n  大小: ${sizeStr}\n  路径: ${relativePath}`;
-  }).join('\n\n');
-  
-  const userPrompt = prompt.trim() && !prompt.startsWith('[文件:') && !prompt.startsWith('[图片:') && !prompt.startsWith('[视频:')
-    ? `\n\n用户说：${prompt}`
-    : '';
-  
-  return `已接收到用户通过微信发送的文件：
-
-${fileList}
-
-文件已保存到工作目录。请勿主动读取或处理这些文件，等待用户明确指示需要做什么。${userPrompt}`;
-}
+import { commandExists, spawnProc, setupAbort, setupTimeout, stripAnsi, buildMediaPrompt, collectUtf8, writeStdin } from './base.js';
 
 export class KimiAdapter implements CLIAdapter {
   readonly name = 'kimi';
@@ -47,10 +20,11 @@ export class KimiAdapter implements CLIAdapter {
       const fullPrompt = buildMediaPrompt(prompt, opts.media, workDir);
       const args: string[] = [];
 
-      // ── Prompt ──
-      args.push('-p', fullPrompt);
-
       // ── Print mode (non-interactive, implies --yolo) ──
+      // The prompt is fed via stdin (below), NOT argv: passing free-form user text as a
+      // `-p <prompt>` argv element is a shell-injection vector on Windows where spawnProc
+      // runs under cmd.exe (shell:true), so a WeChat message with &, |, %VAR%, etc. would
+      // be interpreted by the shell. stdin avoids cmd.exe parsing entirely.
       args.push('--print');
 
       // ── Output format ──
@@ -95,8 +69,10 @@ export class KimiAdapter implements CLIAdapter {
       if (settings.verbose) args.push('--verbose');
 
       // ── System prompt (via config override) ──
+      // No hand-rolled quotes: spawn passes this as a single argv token, so quoting the
+      // value ourselves both breaks on values containing quotes and adds injection surface.
       if (settings.systemPrompt) {
-        args.push('--config', `agent.system_prompt_suffix="${settings.systemPrompt}"`);
+        args.push('--config', `agent.system_prompt_suffix=${settings.systemPrompt}`);
       }
 
       if (opts.extraArgs) args.push(...opts.extraArgs);
@@ -104,21 +80,22 @@ export class KimiAdapter implements CLIAdapter {
       log.debug(`[kimi] model=${settings.model || 'default'} thinking=${settings.thinking || false}`);
 
       const proc = spawnProc(this.command, args, {
-        cwd: settings.workDir || opts.workDir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env },
+        cwd: settings.workDir || opts.workDir, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env },
       });
+
+      // Feed the prompt over stdin (see note above) instead of argv.
+      log.debug(`[kimi] stdin: ${fullPrompt.substring(0, 200)}${fullPrompt.length > 200 ? '…' : ''}`);
+      writeStdin(proc, fullPrompt);
 
       setupAbort(proc, opts.signal);
       const timer = setupTimeout(proc, opts.timeout);
-
-      let stdout = '';
-      let stderr = '';
-      proc.stdout!.on('data', (c: Buffer) => { stdout += c.toString(); });
-      proc.stderr!.on('data', (c: Buffer) => { stderr += c.toString(); });
+      const out = collectUtf8(proc);
 
       proc.on('close', (code) => {
         if (timer) clearTimeout(timer);
         if (opts.signal?.aborted) { resolve({ text: '已取消', error: true }); return; }
 
+        const stdout = out.stdout(), stderr = out.stderr();
         const output = stripAnsi(stdout.trim() || stderr.trim());
 
         // Try to extract session ID from stderr (kimi outputs session info there)

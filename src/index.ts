@@ -11,6 +11,7 @@ import {
   ensureDataDir,
 } from './config.js';
 import { log, setLogLevel, LogLevel } from './utils/logger.js';
+import { initProxyFromEnv } from './utils/http.js';
 
 async function main() {
   const subcommand = process.argv[2];
@@ -36,6 +37,9 @@ async function main() {
     setLogLevel(LogLevel.DEBUG);
   }
 
+  // Honor HTTPS_PROXY/HTTP_PROXY so users behind a proxy can reach WeChat (issue #18).
+  await initProxyFromEnv();
+
   // ─── 1. Detect CLI tools ─────────────────────────────
 
   log.info('检测已安装的 CLI 工具...');
@@ -57,31 +61,32 @@ async function main() {
 
   // ─── 2. WeChat login ─────────────────────────────────
 
-  let credentials = loadCredentials();
+  // QR display helper, defined once and reused for initial login AND session-expiry self-heal.
+  let qrGenerate: ((text: string, opts: { small: boolean }) => void) | null = null;
+  try {
+    const mod = await import('qrcode-terminal');
+    const qt = mod.default || mod;
+    qrGenerate = qt.generate?.bind(qt) ?? null;
+  } catch {
+    // fallback to URL display
+  }
+  const showQR = (qrContent: string) => {
+    if (qrGenerate) qrGenerate(qrContent, { small: true });
+    else log.info(`请用微信扫描二维码: ${qrContent}`);
+  };
 
+  let credentials = loadCredentials();
   if (!credentials) {
     log.info('需要登录微信 ClawBot...');
-
-    let qrGenerate: ((text: string, opts: { small: boolean }) => void) | null = null;
-    try {
-      const mod = await import('qrcode-terminal');
-      const qt = mod.default || mod;
-      qrGenerate = qt.generate?.bind(qt) ?? null;
-    } catch {
-      // fallback to URL display
-    }
-
-    credentials = await login((qrContent) => {
-      if (qrGenerate) {
-        qrGenerate(qrContent, { small: true });
-      } else {
-        log.info(`请用微信扫描二维码: ${qrContent}`);
-      }
-    });
-
+    credentials = await login(showQR);
     saveCredentials(credentials);
   } else {
     log.info('使用已保存的登录凭据');
+  }
+
+  if (config.allowedUsers.length === 0) {
+    log.warn('⚠️ allowedUsers 为空：任何能私聊机器人的微信好友都可运行 CLI（拥有完整权限）。');
+    log.warn('   如需限制，请在 ~/.wx-ai-bridge/config.json 设置 allowedUsers: ["<你的 ilink_user_id>"]');
   }
 
   // ─── 3. Start bridge ─────────────────────────────────
@@ -89,6 +94,13 @@ async function main() {
   const ilink = new ILinkClient(credentials);
   const sessions = new SessionManager();
   const router = new Router(ilink, registry, sessions, config);
+
+  // Self-heal on session expiry (errcode -14/-13): re-run QR login instead of crashing.
+  ilink.setReloginHandler(async () => {
+    const creds = await login(showQR);
+    saveCredentials(creds);
+    return creds;
+  });
 
   router.start();
   ilink.start();
@@ -100,17 +112,45 @@ async function main() {
 
   // ─── Graceful shutdown ────────────────────────────────
 
-  const shutdown = () => {
-    log.info('正在关闭...');
-    ilink.stop();
-    process.exit(0);
+  let shuttingDown = false;
+  const shutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log.info(`收到 ${signal}，正在关闭...`);
+    try { router.stop(); } catch { /* ignore */ }
+    try { ilink.stop(); } catch { /* ignore */ }
+    // Give in-flight aborts (child SIGTERM/taskkill) a brief moment, then exit.
+    setTimeout(() => process.exit(0), 300);
   };
 
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  // An unhandled *rejection* is usually a stray promise and safe to log-and-continue.
+  process.on('unhandledRejection', (reason) => {
+    log.error('未处理的 Promise 拒绝:', reason);
+  });
+  // An uncaught *exception* leaves the runtime in an undefined state (Node docs), so treat
+  // it as fatal: clean up and exit non-zero, letting a supervisor restart a fresh process.
+  process.on('uncaughtException', (err) => {
+    log.error('未捕获的异常 (即将退出):', err);
+    if (!shuttingDown) {
+      shuttingDown = true;
+      try { router.stop(); } catch { /* ignore */ }
+      try { ilink.stop(); } catch { /* ignore */ }
+    }
+    setTimeout(() => process.exit(1), 200);
+  });
 }
 
-main().catch((err) => {
-  log.error('启动失败:', err);
+main().catch(async (err) => {
+  const { isRetryableNetworkError, describeNetworkError } = await import('./utils/http.js');
+  if (isRetryableNetworkError(err) || /ECONNRESET|fetch failed|网络请求/.test(String(err?.message))) {
+    log.error('启动失败 (网络问题):');
+    log.error(describeNetworkError(err));
+    log.error('微信接口: https://ilinkai.weixin.qq.com — 确认本机可访问该地址后重试。');
+  } else {
+    log.error('启动失败:', err);
+  }
   process.exit(1);
 });

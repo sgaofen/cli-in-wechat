@@ -1,33 +1,6 @@
 import { log } from '../utils/logger.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
-import { commandExists, spawnProc, setupAbort, setupTimeout, stripAnsi, isSessionError } from './base.js';
-import type { DownloadedMedia } from '../utils/media.js';
-import { copyMediaToWorkDir } from '../utils/media.js';
-
-function buildMediaPrompt(prompt: string, media?: DownloadedMedia[], workDir?: string): string {
-  if (!media || media.length === 0) return prompt;
-  
-  const copiedMedia = workDir ? media.map(m => copyMediaToWorkDir(m, workDir)) : media;
-  
-  const fileList = copiedMedia.map(m => {
-    const relativePath = workDir && m.path.startsWith(workDir) 
-      ? m.path.slice(workDir.length).replace(/^[\/\\]/, '')
-      : m.path;
-    const typeNames: Record<string, string> = { image: '图片', file: '文件', video: '视频' };
-    const sizeStr = m.size ? `${(m.size / 1024).toFixed(1)}KB` : '未知大小';
-    return `- ${m.fileName}\n  类型: ${typeNames[m.type] || '文件'}\n  大小: ${sizeStr}\n  路径: ${relativePath}`;
-  }).join('\n\n');
-  
-  const userPrompt = prompt.trim() && !prompt.startsWith('[文件:') && !prompt.startsWith('[图片:') && !prompt.startsWith('[视频:')
-    ? `\n\n用户说：${prompt}`
-    : '';
-  
-  return `已接收到用户通过微信发送的文件：
-
-${fileList}
-
-文件已保存到工作目录。请勿主动读取或处理这些文件，等待用户明确指示需要做什么。${userPrompt}`;
-}
+import { commandExists, spawnProc, setupAbort, setupTimeout, stripAnsi, isSessionError, buildMediaPrompt, collectUtf8, writeStdin } from './base.js';
 
 export class GeminiAdapter implements CLIAdapter {
   readonly name = 'gemini';
@@ -78,18 +51,16 @@ export class GeminiAdapter implements CLIAdapter {
 
       // Write prompt to stdin
       log.debug(`[gemini] stdin: ${fullPrompt.substring(0, 200)}${fullPrompt.length > 200 ? '…' : ''}`);
-      proc.stdin!.write(fullPrompt, 'utf8');
-      proc.stdin!.end();
+      writeStdin(proc, fullPrompt);
 
       setupAbort(proc, opts.signal);
       const timer = setupTimeout(proc, opts.timeout);
-      let stdout = '', stderr = '';
-      proc.stdout!.on('data', (c: Buffer) => { stdout += c.toString(); });
-      proc.stderr!.on('data', (c: Buffer) => { stderr += c.toString(); });
+      const out = collectUtf8(proc);
 
       proc.on('close', (code) => {
         if (timer) clearTimeout(timer);
         if (opts.signal?.aborted) { resolve({ text: '已取消', error: true }); return; }
+        const stdout = out.stdout(), stderr = out.stderr();
         try {
           const r = JSON.parse(stdout);
           const isErr = !!r.error;

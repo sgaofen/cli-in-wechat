@@ -3,6 +3,7 @@ import { join, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { createDecipheriv } from 'node:crypto';
 import { log } from './logger.js';
+import { fetchWithRetry } from './http.js';
 import type { CDNMedia, ImageItem, FileItem, VideoItem } from '../ilink/types.js';
 import { parseAesKey } from '../utils/crypto.js';
 
@@ -53,12 +54,16 @@ export async function downloadMedia(
   
   log.debug(`[media] Downloading from: ${url.substring(0, 100)}...`);
   
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     headers: {
       'User-Agent': 'MicroMessenger/6.0',
     },
+    label: 'media-download',
+    retries: 3,
+    retryOnHttpError: true, // downloads are idempotent GETs
+    timeoutMs: 60_000,
   });
-  
+
   if (!response.ok) {
     const body = await response.text().catch(() => '');
     log.error(`[media] HTTP ${response.status}: ${body.substring(0, 200)}`);
@@ -90,9 +95,10 @@ export async function downloadMedia(
     log.warn(`[media] No aes_key and unrecognized format, saving raw bytes (file may be unviewable)`);
   }
   
-  const fileName = options.fileName || generateFileName(options.type);
+  // options.fileName may come straight from an untrusted WeChat file_item.file_name.
+  const fileName = safeFileName(options.fileName, options.type);
   const filePath = join(mediaDir, fileName);
-  
+
   writeFileSync(filePath, data);
   
   log.info(`[media] Saved: ${filePath} (${data.length} bytes)`);
@@ -113,8 +119,9 @@ export async function downloadImage(item: ImageItem, workDir?: string): Promise<
   if (item.url) {
     log.debug(`[media] Using direct URL: ${item.url}`);
     try {
-      const response = await fetch(item.url, {
+      const response = await fetchWithRetry(item.url, {
         headers: { 'User-Agent': 'MicroMessenger/6.0' },
+        label: 'image-url', retries: 2, retryOnHttpError: true, timeoutMs: 60_000,
       });
       if (response.ok) {
         const fileName = extractFileNameFromUrl(item.url);
@@ -211,16 +218,37 @@ function detectFileFormat(data: Buffer): string | null {
 }
 
 function generateFileName(type: 'image' | 'file' | 'video'): string {
-  const timestamp = Date.now();
+  // Date.now() alone collides for files that arrive in the same millisecond; add entropy.
+  const stamp = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const ext = type === 'image' ? 'jpg' : type === 'video' ? 'mp4' : 'bin';
-  return `${type}_${timestamp}.${ext}`;
+  return `${type}_${stamp}.${ext}`;
+}
+
+/**
+ * Sanitize an untrusted file name (a WeChat sender controls file_item.file_name and
+ * the image URL path) so it can never escape the media directory or smuggle in path
+ * separators / control chars. Falls back to a generated name when nothing safe remains.
+ */
+export function safeFileName(name: string | undefined, type: 'image' | 'file' | 'video'): string {
+  if (!name) return generateFileName(type);
+  // Normalize Windows separators first so basename() strips them even on POSIX,
+  // then drop any directory components ("../../etc/passwd" -> "passwd").
+  let base = basename(name.replace(/\\/g, '/'));
+  // Remove control chars and characters illegal in file names across platforms.
+  base = base.replace(/[\x00-\x1f<>:"/\\|?*]/g, '_').trim();
+  // Strip leading dots so "..", ".ssh", ".env" cannot be produced.
+  base = base.replace(/^\.+/, '');
+  if (!base) return generateFileName(type);
+  // Cap absurdly long names (filesystem limits) while keeping the extension.
+  if (base.length > 200) base = base.slice(base.length - 200);
+  return base;
 }
 
 function extractFileNameFromUrl(url: string): string {
   try {
     const parsed = new URL(url);
     const pathParts = parsed.pathname.split('/');
-    return pathParts[pathParts.length - 1] || generateFileName('image');
+    return safeFileName(pathParts[pathParts.length - 1], 'image');
   } catch {
     return generateFileName('image');
   }

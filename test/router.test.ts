@@ -251,3 +251,27 @@ test('exec maps stale default-alias model to empty before adapter execution', as
   assert.equal(capturedModels[0], '');
   assert.equal((sessions.get('u1') as any).model, '');
 });
+
+// ─── Boolean-toggle confirmations must match the stored value (regression) ───
+// Bug: update() mutates the live settings ref, so reading settings.<flag> after update()
+// reported the inverted state. These assert the reply text matches what was actually stored.
+
+for (const { cmd, field, on } of [
+  { cmd: 'verbose', field: 'verbose', on: 'ON' },
+  { cmd: 'search', field: 'search', on: 'ON' },
+  { cmd: 'ephemeral', field: 'ephemeral', on: 'ON' },
+  { cmd: 'thinking', field: 'thinking', on: 'ON (深度思考)' },
+  { cmd: 'bare', field: 'bare', on: 'ON (跳过配置加载)' },
+]) {
+  test(`/${cmd} toggle reports the value it actually stored (on then off)`, async () => {
+    const { router, sessions, messages } = createRouter();
+
+    await router.handleSlash('u1', `/${cmd}`);
+    assert.equal((sessions.get('u1') as any)[field], true, `${field} stored true`);
+    assert.ok(messages[messages.length - 1].text.includes(on), `reply says ${on}`);
+
+    await router.handleSlash('u1', `/${cmd}`);
+    assert.equal((sessions.get('u1') as any)[field], false, `${field} stored false`);
+    assert.ok(messages[messages.length - 1].text.includes('OFF'), 'reply says OFF');
+  });
+}

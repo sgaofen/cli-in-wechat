@@ -3,6 +3,7 @@ import { readFileSync, existsSync, statSync } from 'node:fs';
 import { basename } from 'node:path';
 import { generateWechatUin, encryptAesEcb, aesEcbPaddedSize, encodeMessageAesKey, md5 } from '../utils/crypto.js';
 import { log } from '../utils/logger.js';
+import { fetchWithRetry, describeNetworkError, isRetryableNetworkError } from '../utils/http.js';
 import { savePollCursor, loadPollCursor, saveContextTokens } from '../config.js';
 import { downloadImage, downloadFile, downloadVideo, type DownloadedMedia } from '../utils/media.js';
 import type {
@@ -52,6 +53,15 @@ export class ILinkClient {
   private rateLimitStates = new Map<string, UserRateLimitState>();
   private backoffMs = 1000;
   private abortController: AbortController | null = null;
+  private consecutiveFailures = 0;
+  private longPollTimeoutMs = HTTP_TIMEOUT_MS;
+  private reloginInFlight = false;
+  private onReloginNeeded?: () => Promise<Credentials | null>;
+  // Bounded de-dup of messages: the long-poll cursor can re-deliver a message
+  // (at-least-once), and re-running a CLI command twice is harmful. Keyed per-user
+  // (from_user_id:message_id) so we never collide across conversations.
+  private seenMsgIds = new Set<string>();
+  private seenMsgOrder: string[] = [];
 
   constructor(credentials: Credentials) {
     this.credentials = credentials;
@@ -60,6 +70,31 @@ export class ILinkClient {
 
   onMessage(handler: MessageHandler): void {
     this.handlers.push(handler);
+  }
+
+  /** Optional self-heal: invoked when the session expires (errcode -14/-13). Should
+   *  re-run the QR login, persist the new credentials, and return them — the poll loop
+   *  then swaps them in and continues instead of killing the whole process. */
+  setReloginHandler(handler: () => Promise<Credentials | null>): void {
+    this.onReloginNeeded = handler;
+  }
+
+  updateCredentials(credentials: Credentials): void {
+    this.credentials = credentials;
+  }
+
+  /** First-seen check for a (user, message) pair; records it (bounded) and returns false
+   *  on replay. Composite-keyed so two users never collide on the same numeric id. */
+  private isFreshMessage(userId: string, id: number): boolean {
+    const key = `${userId}:${id}`;
+    if (this.seenMsgIds.has(key)) return false;
+    this.seenMsgIds.add(key);
+    this.seenMsgOrder.push(key);
+    if (this.seenMsgOrder.length > 1000) {
+      const evict = this.seenMsgOrder.shift();
+      if (evict !== undefined) this.seenMsgIds.delete(evict);
+    }
+    return true;
   }
 
   private headers(): Record<string, string> {
@@ -96,6 +131,7 @@ export class ILinkClient {
       try {
         const msgs = await this.getUpdates();
         this.backoffMs = 1000;
+        this.consecutiveFailures = 0;
 
         for (const msg of msgs) {
           await this.processMessage(msg);
@@ -106,28 +142,79 @@ export class ILinkClient {
         const error = err as { name?: string; errcode?: number; message?: string };
 
         if (error.name === 'AbortError') {
-          continue; // normal timeout
+          continue; // normal long-poll timeout, not a failure
         }
 
         if (error.errcode === -14 || error.errcode === -13) {
-          log.error('会话已过期，需要重新登录 (删除 ~/.wx-ai-bridge/credentials.json 后重启)');
-          this.running = false;
-          return;
+          if (await this.handleSessionExpired()) continue;
+          // Keep running either way (never silently kill the process), but give advice that
+          // matches reality: only point at manual re-login when there is no relogin handler.
+          if (!this.onReloginNeeded) {
+            log.error('会话已过期。请删除 ~/.wx-ai-bridge/credentials.json 后重启以重新登录。');
+          } else {
+            log.warn('自动重新登录未成功，将在稍后重试…');
+          }
+          await sleep(30_000);
+          continue;
         }
 
-        log.error('轮询错误:', error.message || err);
-        await sleep(this.backoffMs);
+        this.consecutiveFailures += 1;
+        // Surface a loud, actionable diagnostic once the loop has been failing for a while
+        // (issue #18 class): a steady stream of generic '轮询错误' hides the real cause.
+        if (this.consecutiveFailures === 5 || this.consecutiveFailures % 20 === 0) {
+          if (isRetryableNetworkError(err)) {
+            log.error(`轮询持续失败 ${this.consecutiveFailures} 次:`);
+            log.error(describeNetworkError(err));
+          } else {
+            log.error(`轮询持续失败 ${this.consecutiveFailures} 次:`, error.message || err);
+          }
+        } else {
+          log.error('轮询错误:', error.message || err);
+        }
+
+        // Exponential backoff with full jitter, capped at 30s.
+        const jittered = Math.floor(this.backoffMs * (0.5 + Math.random() * 0.5));
+        await sleep(jittered);
         this.backoffMs = Math.min(this.backoffMs * 2, 30_000);
       }
     }
   }
 
+  /** Drive the optional relogin handler exactly once at a time. Returns true if the
+   *  session was refreshed (caller should continue the loop). */
+  private async handleSessionExpired(): Promise<boolean> {
+    if (!this.onReloginNeeded || this.reloginInFlight) return false;
+    this.reloginInFlight = true;
+    try {
+      log.warn('会话已过期，正在尝试重新登录…');
+      const creds = await this.onReloginNeeded();
+      if (creds) {
+        this.credentials = creds;
+        this.consecutiveFailures = 0;
+        this.backoffMs = 1000;
+        log.info('重新登录成功，继续运行');
+        return true;
+      }
+      return false;
+    } catch (err) {
+      log.error('自动重新登录失败:', (err as Error).message);
+      return false;
+    } finally {
+      this.reloginInFlight = false;
+    }
+  }
+
   private async getUpdates(): Promise<WeixinMessage[]> {
+    // Keep the manual long-poll deadline: when it fires it aborts the controller, which
+    // fetchWithRetry surfaces as an AbortError (NOT retried) so pollLoop treats it as a
+    // normal long-poll timeout. Genuine transient drops (ECONNRESET) within the window
+    // are retried by fetchWithRetry. The per-attempt timeout is a backstop set above the
+    // manual deadline so the manual abort always wins the race.
     this.abortController = new AbortController();
-    const timer = setTimeout(() => this.abortController?.abort(), HTTP_TIMEOUT_MS);
+    const timer = setTimeout(() => this.abortController?.abort(), this.longPollTimeoutMs);
 
     try {
-      const res = await fetch(
+      const res = await fetchWithRetry(
         `${this.credentials.baseUrl}/ilink/bot/getupdates`,
         {
           method: 'POST',
@@ -137,6 +224,10 @@ export class ILinkClient {
             base_info: this.baseInfo(),
           }),
           signal: this.abortController.signal,
+          label: 'getupdates',
+          retries: 2,
+          retryOnHttpError: true,
+          timeoutMs: this.longPollTimeoutMs + 15_000,
         },
       );
 
@@ -151,6 +242,13 @@ export class ILinkClient {
         );
         e.errcode = data.errcode;
         throw e;
+      }
+
+      // Honor the server-suggested long-poll window for the next round (clamped sanely),
+      // instead of always assuming the hardcoded 45s.
+      const serverMs = data.longpolling_timeout_ms;
+      if (typeof serverMs === 'number' && Number.isFinite(serverMs) && serverMs > 0) {
+        this.longPollTimeoutMs = Math.min(120_000, Math.max(10_000, serverMs + 5_000));
       }
 
       if (data.get_updates_buf) {
@@ -170,11 +268,17 @@ export class ILinkClient {
     // Only process user messages, skip bot echoes
     if (msg.message_type !== 1) return;
 
+    // Drop long-poll re-deliveries so a command is never executed twice (at-most-once).
+    if (!this.isFreshMessage(msg.from_user_id, msg.message_id)) {
+      log.debug(`[msg] 跳过重复消息 message_id=${msg.message_id}`);
+      return;
+    }
+
     // Cache context_token for this user
     this.contextTokens.set(msg.from_user_id, msg.context_token);
     saveContextTokens(this.contextTokens);
 
-    log.debug(`[msg] item_list=${JSON.stringify(msg.item_list)}`);
+    log.debug(`[msg] item_list=${JSON.stringify(redactSecrets(msg.item_list))}`);
     const { text, refText, mediaItems } = await parseMessage(msg);
     if (!text && !refText && mediaItems.length === 0) return;
 
@@ -324,7 +428,7 @@ export class ILinkClient {
     contextToken: string,
     itemList: MessageItem[],
   ): Promise<void> {
-    const res = await fetch(
+    const res = await fetchWithRetry(
       `${this.credentials.baseUrl}/ilink/bot/sendmessage`,
       {
         method: 'POST',
@@ -341,6 +445,9 @@ export class ILinkClient {
           },
           base_info: this.baseInfo(),
         }),
+        label: 'send',
+        retries: 2,
+        timeoutMs: 30_000,
       },
     );
 
@@ -473,7 +580,7 @@ export class ILinkClient {
     const aeskey = randomBytes(16);
 
     // Get upload URL from iLink
-    const uploadResp = await fetch(
+    const uploadResp = await fetchWithRetry(
       `${this.credentials.baseUrl}/ilink/bot/getuploadurl`,
       {
         method: 'POST',
@@ -489,6 +596,9 @@ export class ILinkClient {
           no_need_thumb: true,
           base_info: this.baseInfo(),
         }),
+        label: 'getuploadurl',
+        retries: 2,
+        timeoutMs: 30_000,
       },
     );
 
@@ -509,10 +619,13 @@ export class ILinkClient {
 
     log.debug(`[upload] Uploading to CDN: ${rawsize} bytes`);
 
-    const cdnResp = await fetch(cdnUrl, {
+    const cdnResp = await fetchWithRetry(cdnUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/octet-stream' },
       body: new Uint8Array(ciphertext),
+      label: 'cdn-upload',
+      retries: 2,
+      timeoutMs: 60_000, // large files need a longer per-attempt window
     });
 
     if (!cdnResp.ok) {
@@ -564,7 +677,7 @@ export class ILinkClient {
       return cached.ticket;
     }
 
-    const res = await fetch(
+    const res = await fetchWithRetry(
       `${this.credentials.baseUrl}/ilink/bot/getconfig`,
       {
         method: 'POST',
@@ -574,6 +687,9 @@ export class ILinkClient {
           context_token: contextToken,
           base_info: this.baseInfo(),
         }),
+        label: 'getconfig',
+        retries: 1,
+        timeoutMs: 15_000,
       },
     );
 
@@ -594,7 +710,8 @@ export class ILinkClient {
     ticket: string,
     status: 1 | 2,
   ): Promise<void> {
-    await fetch(`${this.credentials.baseUrl}/ilink/bot/sendtyping`, {
+    // Fire-and-forget heartbeat (every ~5s); a timeout prevents hung sockets from piling up.
+    await fetchWithRetry(`${this.credentials.baseUrl}/ilink/bot/sendtyping`, {
       method: 'POST',
       headers: this.headers(),
       body: JSON.stringify({
@@ -603,11 +720,34 @@ export class ILinkClient {
         status,
         base_info: this.baseInfo(),
       }),
+      label: 'sendtyping',
+      retries: 0,
+      timeoutMs: 10_000,
     });
   }
 }
 
 // ─── Helpers ───────────────────────────────────────────────
+
+const SECRET_KEYS = new Set([
+  'aes_key', 'aeskey', 'encrypt_query_param', 'full_url', 'url',
+]);
+
+/** Deep-clone a value while masking secret fields by name, so DEBUG logs never leak
+ *  media decryption keys / signed CDN URLs that could be replayed. */
+export function redactSecrets(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactSecrets);
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = SECRET_KEYS.has(k.toLowerCase())
+        ? (typeof v === 'string' && v.length > 0 ? '***' : v)
+        : redactSecrets(v);
+    }
+    return out;
+  }
+  return value;
+}
 
 async function parseMessage(msg: WeixinMessage): Promise<{ text: string; refText: string; mediaItems: DownloadedMedia[] }> {
   const parts: string[] = [];
