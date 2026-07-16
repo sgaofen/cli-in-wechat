@@ -23,10 +23,10 @@ async function main() {
 
   console.log(
     `
-╔══════════════════════════════════════╗
-║       cli-in-wechat  v0.1.0        ║
-║  Claude / Codex / Gemini / Kimi    ║
-╚══════════════════════════════════════╝
+╔═════════════════════════════════════════════╗
+║            cli-in-wechat  v0.1.0            ║
+║  Claude / Codex / Gemini / Kimi / OpenCode  ║
+╚═════════════════════════════════════════════╝
 `,
   );
 
@@ -49,7 +49,7 @@ async function main() {
   const available = registry.getAvailableNames();
   if (available.length === 0) {
     log.error('没有检测到任何可用的 AI CLI 工具');
-    log.error('请安装以下工具之一: claude, codex, gemini, aider');
+    log.error('请安装以下工具之一: claude, codex, gemini, kimi, opencode');
     process.exit(1);
   }
 

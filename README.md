@@ -132,7 +132,7 @@ Claude Code 需要你做选择时，问题自动转发到微信：
 | `/system <提示>` | 系统提示 | Claude |
 | `/tools <列表>` | 允许工具 | Claude |
 | `/notool <列表>` | 禁用工具 | Claude |
-| `/verbose` | 详细输出 | Claude |
+| `/verbose` | 详细输出 | Kimi |
 | `/bare` | 跳过配置加载 | Claude |
 | `/adddir <路径>` | 额外目录 | Claude/Codex |
 | `/name <名>` | 会话命名 | Claude |
@@ -144,6 +144,8 @@ Claude Code 需要你做选择时，问题自动转发到微信：
 | `/approval <模式>` | 审批模式 | Gemini |
 | `/include <目录>` | 上下文目录 | Gemini |
 | `/ext <名>` | Extensions | Gemini |
+| `/thoughts` | 显示 AI 思考内容 | 通用 |
+| `/msgmode <verbose\|normal\|compact\|default>` | 消息详细度 | 通用 |
 
 ### 操作
 
@@ -157,6 +159,7 @@ Claude Code 需要你做选择时，问题自动转发到微信：
 | `/files` | 目录结构 |
 | `/compact` | 压缩上下文 |
 | `/stats` | 使用统计 |
+| `/send <文件路径>` | 发送本地文件到微信 |
 
 ### 会话
 
@@ -233,6 +236,8 @@ Claude Code 需要你做选择时，问题自动转发到微信：
 src/
 ├── index.ts              # 入口
 ├── config.ts             # 配置
+├── cli/                  # 子命令
+│   └── send.ts           # wcli send：发送本地文件到微信
 ├── ilink/                # 微信 iLink Bot API
 │   ├── types.ts          # 协议类型
 │   ├── auth.ts           # QR 扫码登录

@@ -74,7 +74,7 @@ export class GeminiAdapter implements CLIAdapter {
           // 针对常见 Gemini API 错误给出更明确的提示
           if (raw.includes('ModelNotFoundError') || raw.includes('Requested entity was not found')) {
             const model = settings.model || '默认模型';
-            resolve({ text: `模型 "${model}" 不存在或无访问权限。\n请用 /model 切换，例如:\n/model gemini-2.5-pro\n/model gemini-2.0-flash`, error: true });
+            resolve({ text: `模型 "${model}" 不存在或无访问权限。\n请用 /model 切换到一个可用的 Gemini 模型（运行 gemini 查看当前可用型号）。`, error: true });
           } else if (raw.includes('API_KEY') || raw.includes('PERMISSION_DENIED') || raw.includes('UNAUTHENTICATED')) {
             resolve({ text: `Gemini API 认证失败，请检查 GEMINI_API_KEY 是否正确。`, error: true });
           } else if (raw.includes('RESOURCE_EXHAUSTED') || raw.includes('quota')) {

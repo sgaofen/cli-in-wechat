@@ -11,7 +11,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        node: [18, 22]
+        node: [20, 22]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +32,7 @@ jobs:
       - name: Run unit tests
         # Invoke node directly under bash so the shell expands test/*.test.ts on every OS.
         # Going through `npm test` re-spawns via cmd.exe on Windows (no globbing), and
-        # Node 18's --test (unlike Node 21+) can't glob itself -> "Could not find test/*.test.ts".
+        # Node 20's --test (unlike Node 21+) can't glob itself -> "Could not find test/*.test.ts".
         shell: bash
         run: node --import tsx --test test/*.test.ts
 
