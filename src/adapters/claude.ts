@@ -1,6 +1,6 @@
 import { log } from '../utils/logger.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities, IntermediateMessage } from './base.js';
-import { commandExists, spawnProc, setupAbort, setupTimeout, isSessionError, buildMediaPrompt, collectUtf8, writeStdin } from './base.js';
+import { commandExists, spawnCli, setupAbort, setupTimeout, isSessionError, buildMediaPrompt, collectUtf8, writeStdin } from './base.js';
 
 function truncate(text: string, maxLen: number): string {
   return text.length > maxLen ? `${text.substring(0, maxLen)}...` : text;
@@ -246,7 +246,11 @@ export class ClaudeAdapter implements CLIAdapter {
     if (settings.effort) sdkOpts.effort = settings.effort;
     if (settings.model) sdkOpts.model = settings.model;
     if (settings.maxBudget > 0) sdkOpts.maxBudgetUsd = settings.maxBudget;
-    if (settings.systemPrompt) sdkOpts.appendSystemPrompt = settings.systemPrompt;
+    // `appendSystemPrompt` is NOT a public SDK Options field — it is silently dropped, so
+    // /system was a no-op on the SDK path. Append via the preset systemPrompt form instead
+    // (keeps Claude Code's default prompt and adds ours). The CLI fallback still uses
+    // --append-system-prompt below.
+    if (settings.systemPrompt) sdkOpts.systemPrompt = { type: 'preset', preset: 'claude_code', append: settings.systemPrompt };
     if (settings.allowedTools) sdkOpts.allowedTools = settings.allowedTools.split(',').map(s => s.trim());
 
     // Session resume
@@ -383,16 +387,16 @@ export class ClaudeAdapter implements CLIAdapter {
   private executeWithCLI(prompt: string, opts: ExecOptions): Promise<ExecResult> {
     return new Promise((resolve) => {
       const { settings } = opts;
-      // -p enables print (non-interactive) mode; prompt is passed via stdin below
-      // to avoid Windows cmd.exe issues with special characters in shell mode.
-      const args = ['-p', '--output-format', 'stream-json', '--thinking', 'enabled', '--verbose'];
+      // -p enables print (non-interactive) mode; prompt is passed via stdin below.
+      // `--thinking`/`--max-turns` were removed from the Claude CLI (2.x); thinking is now
+      // model/effort-driven and turn caps are configured elsewhere, so neither is passed here.
+      const args = ['-p', '--output-format', 'stream-json', '--verbose'];
 
       switch (settings.mode) {
         case 'auto': args.push('--dangerously-skip-permissions'); break;
         case 'plan': args.push('--permission-mode', 'plan'); break;
       }
       if (settings.effort) args.push('--effort', settings.effort);
-      args.push('--max-turns', String(settings.maxTurns));
       if (settings.model) args.push('--model', settings.model);
       if (settings.maxBudget > 0) args.push('--max-budget-usd', String(settings.maxBudget));
       if (settings.allowedTools) args.push('--allowedTools', settings.allowedTools);
@@ -408,7 +412,7 @@ export class ClaudeAdapter implements CLIAdapter {
       log.debug(`[claude] effort=${settings.effort} model=${settings.model || 'default'} mode=${settings.mode}`);
       log.debug(`[claude] stdin prompt length: ${prompt.length}`);
 
-      const proc = spawnProc(this.command, args, {
+      const proc = spawnCli(this.command, args, {
         cwd: settings.workDir || opts.workDir,
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env },

@@ -1,6 +1,6 @@
 import { log } from '../utils/logger.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
-import { commandExists, spawnProc, setupAbort, setupTimeout, stripAnsi, buildMediaPrompt, collectUtf8, writeStdin } from './base.js';
+import { commandExists, spawnCli, setupAbort, setupTimeout, stripAnsi, buildMediaPrompt, collectUtf8, writeStdin } from './base.js';
 import { execSync } from 'node:child_process';
 
 const modelResolveCache = new Map<string, string>();
@@ -78,7 +78,9 @@ private resolveModelArg(model: string, workDir?: string): string {
       }
 
       if (settings.mode === 'auto') {
-        args.push('--dangerously-skip-permissions');
+        // `--dangerously-skip-permissions` was removed (1.18); `--auto` auto-approves
+        // permissions that aren't explicitly denied.
+        args.push('--auto');
       }
 
       if (settings.model) {
@@ -95,7 +97,7 @@ private resolveModelArg(model: string, workDir?: string): string {
 
       log.debug(`[opencode] executing: run --format json --thinking`);
 
-      const proc = spawnProc(this.command, args, {
+      const proc = spawnCli(this.command, args, {
         cwd: settings.workDir || opts.workDir,
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env },

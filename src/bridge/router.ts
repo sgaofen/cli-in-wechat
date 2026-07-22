@@ -286,14 +286,14 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           '/status  查看所有配置',
           '/model <名>  切模型',
           '/mode <auto|safe|plan>  权限',
-          '/effort <low|med|high|max>  深度',
+          '/effort <low|med|high|xhigh|max>  深度',
           '/turns <数>  最大轮次',
           '/budget <$>  预算(off=无限)',
           '/dir <路径>  工作目录',
           '/system <词>  追加系统提示',
           '/tools <列表>  允许工具',
           '/notool <列表>  禁用工具',
-          '/verbose  CLI详细输出(Kimi)',
+          '/verbose  已弃用(Kimi 新版无 --verbose)',
           '/bare  跳过配置加载',
           '/adddir <路径>  额外目录',
           '/name <名>  会话命名',
@@ -304,7 +304,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           '/approval <模式>  审批(Gemini)',
           '/include <目录>  上下文(Gemini)',
           '/ext <名>  扩展(Gemini)',
-          '/thinking  深度思考(Kimi)',
+          '/thinking  已弃用(Kimi 新版无 --thinking)',
           '/thoughts  显示AI思考内容',
           '/msgmode <verbose|normal|compact|default>  消息详细度',
           '',
@@ -397,9 +397,9 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         if (!v) { await reply('/mode <auto|safe|plan>\nauto=最高权限 safe=需确认 plan=只读'); return true; }
         this.sessions.update(uid, { mode: v as any });
         const desc: Record<string, string> = {
-          auto: 'AUTO\nClaude: --dangerously-skip-permissions\nCodex: --yolo\nGemini: --approval-mode yolo\nKimi: --print (自带yolo)',
-          safe: 'SAFE\nClaude: 默认权限\nCodex: --full-auto\nGemini: --approval-mode default\nKimi: 默认',
-          plan: 'PLAN\nClaude: --permission-mode plan\nCodex: --sandbox read-only\nGemini: --approval-mode plan\nKimi: /plan',
+          auto: 'AUTO\nClaude: --dangerously-skip-permissions\nCodex: --yolo\nGemini: --approval-mode yolo\nKimi: -p (自带auto)',
+          safe: 'SAFE\nClaude: 默认权限\nCodex: --sandbox workspace-write\nGemini: --approval-mode default\nKimi: -p 恒auto (/mode 对Kimi无效)',
+          plan: 'PLAN\nClaude: --permission-mode plan\nCodex: --sandbox read-only\nGemini: --approval-mode plan\nKimi: -p 不支持plan (恒auto)',
         };
         await reply(desc[v]);
         return true;
@@ -427,11 +427,12 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
       case 'effort': case 'e': {
         const map: Record<string, string> = {
-          min: 'low', low: 'low', med: 'medium', medium: 'medium', high: 'high', max: 'max',
+          min: 'low', low: 'low', med: 'medium', medium: 'medium', high: 'high',
+          xhigh: 'xhigh', xh: 'xhigh', max: 'max',
           '1': 'low', '2': 'low', '3': 'medium', '4': 'high', '5': 'max',
         };
         const v = map[arg.toLowerCase()];
-        if (!v) { await reply(`当前: ${settings.effort}\n/effort <low|med|high|max>`); return true; }
+        if (!v) { await reply(`当前: ${settings.effort}\n/effort <low|med|high|xhigh|max>`); return true; }
         this.sessions.update(uid, { effort: v });
         await reply(`effort → ${v}`);
         return true;

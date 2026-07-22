@@ -13,7 +13,7 @@
     ↕  iLink Bot API — 微信官方消息通道 (不封号)
 桥接服务 (你的电脑)
     ↕  spawn / Agent SDK
-claude -p / codex exec / gemini -p / kimi --print / opencode -p
+claude -p / codex exec / gemini -p / kimi -p / opencode run
 ```
 
 ## 功能
@@ -40,7 +40,7 @@ claude -p / codex exec / gemini -p / kimi --print / opencode -p
 npm install -g @anthropic-ai/claude-code   # Claude Code
 npm install -g @openai/codex                # Codex CLI
 npm install -g @google/gemini-cli           # Gemini CLI
-curl -LsSf https://code.kimi.com/install.sh | bash  # Kimi Code
+npm install -g @moonshot-ai/kimi-code       # Kimi Code (或 curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash)
 brew install opencode-ai/tap/opencode       # OpenCode
 ```
 
@@ -125,14 +125,14 @@ Claude Code 需要你做选择时，问题自动转发到微信：
 | `/status` | 查看所有配置 | 通用 |
 | `/model <名>` | 切模型 | 所有 |
 | `/mode <auto\|safe\|plan>` | 权限模式 | 所有 |
-| `/effort <low\|med\|high\|max>` | 思考深度 | Claude |
+| `/effort <low\|med\|high\|xhigh\|max>` | 思考深度 | Claude |
 | `/turns <数>` | 最大轮次 | Claude |
 | `/budget <$>` | API 预算 | Claude |
 | `/dir <路径>` | 工作目录 | 通用 |
 | `/system <提示>` | 系统提示 | Claude |
 | `/tools <列表>` | 允许工具 | Claude |
 | `/notool <列表>` | 禁用工具 | Claude |
-| `/verbose` | 详细输出 | Kimi |
+| `/verbose` | 已弃用（Kimi 新版无 `--verbose`） | — |
 | `/bare` | 跳过配置加载 | Claude |
 | `/adddir <路径>` | 额外目录 | Claude/Codex |
 | `/name <名>` | 会话命名 | Claude |
@@ -140,7 +140,7 @@ Claude Code 需要你做选择时，问题自动转发到微信：
 | `/search` | web 搜索 | Codex |
 | `/ephemeral` | 临时模式 | Codex |
 | `/profile <名>` | 配置 | Codex |
-| `/thinking` | 深度思考 | Kimi |
+| `/thinking` | 已弃用（Kimi 新版无 `--thinking`） | — |
 | `/approval <模式>` | 审批模式 | Gemini |
 | `/include <目录>` | 上下文目录 | Gemini |
 | `/ext <名>` | Extensions | Gemini |
@@ -187,9 +187,11 @@ Claude Code 需要你做选择时，问题自动转发到微信：
 
 | 模式 | Claude | Codex | Gemini | Kimi | OpenCode |
 |---|---|---|---|---|---|
-| `auto` | `--dangerously-skip-permissions` | `--yolo` | `--approval-mode yolo` | `--print` (自带) | `-p` (自带) |
-| `safe` | 默认权限 | `--full-auto` | `--approval-mode default` | 默认 | — |
+| `auto` | `--dangerously-skip-permissions` | `--yolo` | `--approval-mode yolo` | `-p`（自带 auto） | `--auto` |
+| `safe` | 默认权限 | `--sandbox workspace-write` | `--approval-mode default` | `-p` 恒 auto | — |
 | `plan` | `--permission-mode plan` | `--sandbox read-only` | `--approval-mode plan` | — | — |
+
+> 注：Kimi 非交互模式（`-p`）永远是 auto 权限，`--prompt` 不能与 `--yolo/--auto/--plan` 同用，故 `/mode` 对 Kimi 无效。
 
 ## 配置
 
@@ -243,12 +245,12 @@ src/
 │   ├── auth.ts           # QR 扫码登录
 │   └── client.ts         # 长轮询 + 发消息 + typing
 ├── adapters/             # CLI 工具适配器
-│   ├── base.ts           # 接口 + 共享 helpers (跨平台 spawn)
+│   ├── base.ts           # 接口 + 共享 helpers (spawnCli: 绕 .cmd shim 直连 node/exe, argv 逐字)
 │   ├── claude.ts         # Agent SDK + CLI 降级
 │   ├── codex.ts          # codex exec + stdin 传参
-│   ├── gemini.ts         # gemini -p + stdin 传参
-│   ├── kimi.ts           # kimi --print + stdin 传参 (避免 shell 注入)
-│   ├── opencode.ts       # opencode -p -f json
+│   ├── gemini.ts         # gemini + stdin 传参 (-o json)
+│   ├── kimi.ts           # kimi -p (argv 传参, spawnCli 防 cmd.exe 损坏) + --continue 续会话
+│   ├── opencode.ts       # opencode run --format json
 │   └── registry.ts       # 自动检测已安装工具
 ├── bridge/               # 桥接逻辑
 │   ├── session.ts        # 会话持久化 (原子写)

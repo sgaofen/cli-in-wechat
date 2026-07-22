@@ -1,4 +1,6 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, execSync, type ChildProcess } from 'node:child_process';
+import { readFileSync, existsSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { log } from '../utils/logger.js';
 import { copyMediaToWorkDir, type DownloadedMedia } from '../utils/media.js';
 
@@ -139,6 +141,74 @@ export function spawnProc(cmd: string, args: string[], opts: import('node:child_
   log.debug(`[spawn] ${cmd} ${args.map(a => JSON.stringify(a)).join(' ')}`);
   if (!WIN) return spawn(cmd, args, opts);
   return spawn(cmd, args, { ...opts, shell: true });
+}
+
+/** Cache of resolved Windows direct-spawn targets, keyed by command. `null` = resolution
+ *  failed, so spawnCli falls back to the legacy shell:true path. */
+const winTargetCache = new Map<string, { file: string; prepend: string[] } | null>();
+
+/** Resolve a Windows command (usually an npm-generated `.cmd` shim) to a target that can be
+ *  spawned WITHOUT a shell, so argv reaches the child verbatim. npm `.cmd` shims forward args
+ *  through `%*`, which cmd.exe re-parses — mangling any argument containing & | %VAR% " ^ ( ).
+ *  Bypassing the shim (run node.exe on the package's real .js entry, or the native .exe
+ *  directly) sidesteps cmd.exe entirely. Returns null when resolution fails so the caller can
+ *  fall back to shell:true without regressing. */
+function resolveWinDirectTarget(command: string): { file: string; prepend: string[] } | null {
+  if (winTargetCache.has(command)) return winTargetCache.get(command)!;
+  let resolved: { file: string; prepend: string[] } | null = null;
+  try {
+    const where = execSync(`where ${command}`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const paths = where.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    // A native .exe on PATH can be spawned directly.
+    const exe = paths.find((p) => /\.exe$/i.test(p));
+    if (exe) {
+      resolved = { file: exe, prepend: [] };
+    } else {
+      // Parse the .cmd shim to find the real .exe / .js it launches.
+      const shim = paths.find((p) => /\.cmd$/i.test(p));
+      if (shim) {
+        const content = readFileSync(shim, 'utf8');
+        const dir = dirname(shim);
+        // Collapse only INTERIOR double-backslashes; a leading `\\` (UNC share) must survive.
+        const expand = (p: string) =>
+          p.replace(/%~dp0\\?/gi, dir + '\\').replace(/%dp0%\\?/gi, dir + '\\').replace(/(?<=.)\\{2,}/g, '\\');
+        const target = [...content.matchAll(/"([^"]+)"/g)]
+          .map((m) => expand(m[1]))
+          .filter((p) => /\.(js|cjs|mjs|exe)$/i.test(p))
+          .pop();
+        // Only trust a parsed target that actually exists — a mis-parse must degrade to the
+        // shell fallback (resolved stays null), never poison-cache a permanently-broken path.
+        if (target && existsSync(target)) {
+          resolved = /\.exe$/i.test(target)
+            ? { file: target, prepend: [] }
+            : { file: process.execPath, prepend: [target] }; // node <entry.js>
+        }
+      }
+    }
+  } catch { resolved = null; }
+  winTargetCache.set(command, resolved);
+  return resolved;
+}
+
+/** Spawn a CLI so that every argv element reaches the child verbatim on all platforms.
+ *  POSIX: plain spawn (no shell). Windows: spawn past the `.cmd` shim (node.exe + entry, or the
+ *  native .exe) so cmd.exe never re-parses the argv; only if that resolution fails do we fall
+ *  back to the legacy shell:true path. Use this for any adapter that puts free-form user text
+ *  on argv (e.g. Kimi's `-p <prompt>`); it also protects user-controlled flag VALUES
+ *  (/system, /dir, /model) that would otherwise be mangled by cmd.exe. */
+export function spawnCli(cmd: string, args: string[], opts: import('node:child_process').SpawnOptions): ChildProcess {
+  if (!WIN) {
+    log.debug(`[spawn] ${cmd} ${args.map((a) => JSON.stringify(a)).join(' ')}`);
+    return spawn(cmd, args, opts);
+  }
+  const target = resolveWinDirectTarget(cmd);
+  if (target) {
+    const full = [...target.prepend, ...args];
+    log.debug(`[spawn] ${target.file} ${full.map((a) => JSON.stringify(a)).join(' ')}`);
+    return spawn(target.file, full, { ...opts, shell: false, windowsVerbatimArguments: false });
+  }
+  log.warn(`[spawn] '${cmd}' not resolved past shell; argv with & | % " ^ may be mangled on Windows`);
+  return spawnProc(cmd, args, opts);
 }
 
 export function commandExists(cmd: string): Promise<boolean> {

@@ -1,6 +1,6 @@
 import { log } from '../utils/logger.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
-import { commandExists, spawnProc, setupAbort, setupTimeout, stripAnsi, isSessionError, buildMediaPrompt, collectUtf8, writeStdin } from './base.js';
+import { commandExists, spawnCli, setupAbort, setupTimeout, stripAnsi, isSessionError, buildMediaPrompt, collectUtf8, writeStdin } from './base.js';
 
 export class CodexAdapter implements CLIAdapter {
   readonly name = 'codex';
@@ -32,7 +32,9 @@ export class CodexAdapter implements CLIAdapter {
         } else if (settings.sandbox) {
           args.push('--sandbox', settings.sandbox);
         } else {
-          args.push('--full-auto');
+          // `--full-auto` was removed from `codex exec` (0.128); workspace-write is the
+          // equivalent "auto within a sandbox" default. exec auto-approves inside the sandbox.
+          args.push('--sandbox', 'workspace-write');
         }
 
         args.push('--skip-git-repo-check');
@@ -40,8 +42,9 @@ export class CodexAdapter implements CLIAdapter {
         // Model
         if (settings.model) args.push('-m', settings.model);
 
-        // Web search
-        if (settings.search) args.push('--search');
+        // Web search: `--search` is no longer an `exec` flag (it's top-level only). Since v0.128
+        // web search is on-by-default in cached mode; force LIVE search via config override.
+        if (settings.search) args.push('-c', 'tools.web_search=live');
 
         // Ephemeral
         if (settings.ephemeral) args.push('--ephemeral');
@@ -56,7 +59,7 @@ export class CodexAdapter implements CLIAdapter {
       if (opts.extraArgs) args.push(...opts.extraArgs);
 
       log.debug(`[codex] mode=${settings.mode} sandbox=${settings.sandbox || 'yolo'} search=${settings.search}`);
-      const proc = spawnProc(this.command, args, {
+      const proc = spawnCli(this.command, args, {
         cwd: workDir, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env },
       });
 

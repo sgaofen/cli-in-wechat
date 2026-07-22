@@ -1,14 +1,32 @@
 import { log } from '../utils/logger.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
-import { commandExists, spawnProc, setupAbort, setupTimeout, stripAnsi, buildMediaPrompt, collectUtf8, writeStdin } from './base.js';
+import { commandExists, spawnCli, setupAbort, setupTimeout, stripAnsi, isSessionError, buildMediaPrompt, collectUtf8 } from './base.js';
 
+/**
+ * Kimi Code CLI adapter (MoonshotAI/kimi-code, `@moonshot-ai/kimi-code`).
+ *
+ * Rewritten for the current flag surface (issue #21). The pre-1.x flags the old adapter used
+ * — `--print`, `--final-message-only`, `--thinking`, `--max-steps-per-turn`, `-w`, `--verbose`,
+ * `--config` — no longer exist. The current contract:
+ *   • non-interactive: `-p <prompt>` with the prompt on ARGV (kimi does NOT read stdin here);
+ *   • `-p` implies auto-approve and CANNOT be combined with --yolo/--auto/--plan, so the
+ *     bridge's /mode is a no-op for Kimi (always auto in print mode);
+ *   • resume: `--continue` (continue the most recent session in the cwd) — used instead of the
+ *     `-S <id>` form because the session-id format has drifted across versions (session_<uuid>
+ *     vs ULID); this mirrors the Codex `--last` approach and is version-stable;
+ *   • `--output-format text`, `-m <model>`, `--add-dir <dir>` remain.
+ *
+ * The argv prompt is why this adapter uses spawnCli (not spawnProc): on Windows spawnProc runs
+ * under cmd.exe (shell:true), which would mangle any prompt containing & | %VAR% " ^ ( ).
+ */
 export class KimiAdapter implements CLIAdapter {
   readonly name = 'kimi';
   readonly displayName = 'Kimi Code';
   readonly command = 'kimi';
   readonly capabilities: AdapterCapabilities = {
-    streaming: true, jsonOutput: true, sessionResume: true,
-    modes: ['auto', 'safe', 'plan'], hasEffort: false, hasModel: true, hasSearch: false, hasBudget: false,
+    streaming: false, jsonOutput: false, sessionResume: true,
+    // Only auto is reachable in print mode (`-p` forbids --yolo/--auto/--plan).
+    modes: ['auto'], hasEffort: false, hasModel: true, hasSearch: false, hasBudget: false,
   };
 
   async isAvailable(): Promise<boolean> { return commandExists(this.command); }
@@ -20,72 +38,38 @@ export class KimiAdapter implements CLIAdapter {
       const fullPrompt = buildMediaPrompt(prompt, opts.media, workDir);
       const args: string[] = [];
 
-      // ── Print mode (non-interactive, implies --yolo) ──
-      // The prompt is fed via stdin (below), NOT argv: passing free-form user text as a
-      // `-p <prompt>` argv element is a shell-injection vector on Windows where spawnProc
-      // runs under cmd.exe (shell:true), so a WeChat message with &, |, %VAR%, etc. would
-      // be interpreted by the shell. stdin avoids cmd.exe parsing entirely.
-      args.push('--print');
-
-      // ── Output format ──
-      // Use text + final-message-only for clean output (like --quiet but we control it)
-      args.push('--output-format', 'text', '--final-message-only');
-
-      // ── Mode ──
-      // --print already implies --yolo (auto-approve all)
-      // For plan mode, we don't add --yolo equivalent since --print includes it
-      // but we can hint via prompt or use plan-specific behavior
+      // ── Session resume ──
+      // Auto-tracked runs store the 'continue' sentinel → resume the most recent session in the
+      // cwd (version-stable, no fragile id parsing). If the user pinned a specific id via
+      // /session set or /resume <id>, that real id is stored instead → target it with -S.
+      // Both compose with --prompt (only --continue×--session and --prompt×--yolo/--auto/--plan
+      // are mutually exclusive).
+      const hasSession = settings.sessionIds[this.name];
+      if (hasSession === 'continue') args.push('--continue');
+      else if (hasSession) args.push('-S', hasSession);
 
       // ── Model ──
       if (settings.model) args.push('-m', settings.model);
 
-      // ── Thinking mode ──
-      if (settings.thinking) {
-        args.push('--thinking');
-      }
+      // ── Extra workspace directory ──
+      if (settings.addDir) args.push('--add-dir', settings.addDir);
 
-      // ── Max steps ──
-      if (settings.maxTurns) {
-        args.push('--max-steps-per-turn', String(settings.maxTurns));
-      }
+      // ── Non-interactive output format ──
+      args.push('--output-format', 'text');
 
-      // ── Session resume ──
-      const sid = settings.sessionIds[this.name];
-      if (sid) {
-        args.push('-S', sid);
-      }
-
-      // ── Working directory ──
-      if (settings.workDir || opts.workDir) {
-        args.push('-w', settings.workDir || opts.workDir!);
-      }
-
-      // ── Additional directories ──
-      if (settings.addDir) {
-        args.push('--add-dir', settings.addDir);
-      }
-
-      // ── Verbose ──
-      if (settings.verbose) args.push('--verbose');
-
-      // ── System prompt (via config override) ──
-      // No hand-rolled quotes: spawn passes this as a single argv token, so quoting the
-      // value ourselves both breaks on values containing quotes and adds injection surface.
-      if (settings.systemPrompt) {
-        args.push('--config', `agent.system_prompt_suffix=${settings.systemPrompt}`);
-      }
+      // ── Prompt (non-interactive) ──
+      // The prompt MUST be an argv value; spawnCli guarantees it reaches kimi verbatim on
+      // every platform (no cmd.exe re-parsing on Windows).
+      args.push('-p', fullPrompt);
 
       if (opts.extraArgs) args.push(...opts.extraArgs);
 
-      log.debug(`[kimi] model=${settings.model || 'default'} thinking=${settings.thinking || false}`);
+      log.debug(`[kimi] model=${settings.model || 'default'} resume=${hasSession || 'new'}`);
+      log.debug(`[kimi] prompt: ${fullPrompt.substring(0, 200)}${fullPrompt.length > 200 ? '…' : ''}`);
 
-      const proc = spawnProc(this.command, args, {
-        cwd: settings.workDir || opts.workDir, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env },
+      const proc = spawnCli(this.command, args, {
+        cwd: workDir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env },
       });
-
-      // Feed the prompt over stdin (see note above) instead of argv.
-      log.debug(`[kimi] stdin: ${fullPrompt.substring(0, 200)}${fullPrompt.length > 200 ? '…' : ''}`);
-      writeStdin(proc, fullPrompt);
 
       setupAbort(proc, opts.signal);
       const timer = setupTimeout(proc, opts.timeout);
@@ -96,16 +80,17 @@ export class KimiAdapter implements CLIAdapter {
         if (opts.signal?.aborted) { resolve({ text: '已取消', error: true }); return; }
 
         const stdout = out.stdout(), stderr = out.stderr();
-        const output = stripAnsi(stdout.trim() || stderr.trim());
-
-        // Try to extract session ID from stderr (kimi outputs session info there)
-        const sidMatch = stderr.match(/session[_\s]id[:\s]+([a-f0-9-]+)/i);
-        const sessionId = sidMatch?.[1] || (code === 0 ? 'continue' : undefined);
+        // Strip ANSI only. (A previous global "• " bullet-strip was removed: it corrupted
+        // legitimate bulleted lists in Kimi's answer, since content and activity bullets are
+        // indistinguishable by prefix alone.)
+        const output = stripAnsi(stdout.trim() || stderr.trim()).trim();
 
         resolve({
           text: output || `exit ${code}`,
-          sessionId,
+          // Sentinel: presence (not value) tells the router to pass --continue next time.
+          sessionId: code === 0 ? 'continue' : undefined,
           error: code !== 0,
+          sessionExpired: code !== 0 && !!hasSession && isSessionError(stripAnsi(stderr) || output),
         });
       });
 

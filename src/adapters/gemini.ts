@@ -1,6 +1,6 @@
 import { log } from '../utils/logger.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
-import { commandExists, spawnProc, setupAbort, setupTimeout, stripAnsi, isSessionError, buildMediaPrompt, collectUtf8, writeStdin } from './base.js';
+import { commandExists, spawnCli, setupAbort, setupTimeout, stripAnsi, isSessionError, buildMediaPrompt, collectUtf8, writeStdin } from './base.js';
 
 export class GeminiAdapter implements CLIAdapter {
   readonly name = 'gemini';
@@ -45,7 +45,7 @@ export class GeminiAdapter implements CLIAdapter {
       if (opts.extraArgs) args.push(...opts.extraArgs);
 
       log.debug(`[gemini] approval=${settings.approvalMode || 'yolo'} model=${settings.model || 'default'}`);
-      const proc = spawnProc(this.command, args, {
+      const proc = spawnCli(this.command, args, {
         cwd: settings.workDir || opts.workDir, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env },
       });
 
