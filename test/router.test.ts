@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Router } from '../src/bridge/router.js';
+import { Router, createSendFileMarkerStripper } from '../src/bridge/router.js';
 import type { BridgeConfig } from '../src/config.js';
 import type { WeixinMessage } from '../src/ilink/types.js';
 
@@ -275,3 +275,50 @@ for (const { cmd, field, on } of [
     assert.ok(messages[messages.length - 1].text.includes('OFF'), 'reply says OFF');
   });
 }
+
+// ─── SEND_FILE marker stripping (streamed text) ───────────────────────────────
+// These markers are injected into every prompt as a hint, so the model emits them
+// routinely; anything that reaches WeChat verbatim is a visible bug.
+
+test('stripper removes a marker from streamed text', () => {
+  const strip = createSendFileMarkerStripper();
+  assert.equal(strip('好的，发给你！\n\n[SEND_FILE: /tmp/report.pdf]'), '好的，发给你！');
+});
+
+test('stripper removes several markers in one chunk', () => {
+  const strip = createSendFileMarkerStripper();
+  assert.equal(
+    strip('两个文件：[SEND_FILE: /tmp/a.pdf] 和 [SEND_FILE: /tmp/b.png]'),
+    '两个文件： 和',
+  );
+});
+
+test('stripper yields nothing for a marker-only chunk', () => {
+  const strip = createSendFileMarkerStripper();
+  assert.equal(strip('[SEND_FILE: /tmp/a.pdf]'), '');
+});
+
+test('stripper leaves ordinary bracketed text untouched', () => {
+  const strip = createSendFileMarkerStripper();
+  assert.equal(strip('见 [附件] 与 [1] 的说明'), '见 [附件] 与 [1] 的说明');
+});
+
+test('stripper rejoins a marker split across two chunks', () => {
+  const strip = createSendFileMarkerStripper();
+  // Neither half may reach the chat: the head is held back, the tail completes it.
+  assert.equal(strip('给你：[SEND_FILE: /tmp/re'), '给你：');
+  assert.equal(strip('port.pdf] 收好'), '收好');
+});
+
+test('stripper drops a marker head whose closing bracket never arrives', () => {
+  const strip = createSendFileMarkerStripper();
+  assert.equal(strip('结束了 [SEND_FILE: /tmp/re'), '结束了');
+});
+
+test('stripper stops buffering an unterminated head past the carry cap', () => {
+  const strip = createSendFileMarkerStripper();
+  assert.equal(strip(`[SEND_FILE: ${'x'.repeat(300)}`), '');
+  // The head was too long to carry, so the next chunk stands on its own rather than
+  // being swallowed into an ever-growing buffer.
+  assert.equal(strip('正常文本'), '正常文本');
+});
