@@ -298,13 +298,26 @@ export class ClaudeAdapter implements CLIAdapter {
     //
     // The CLI fallback already bounds itself via setupTimeout(); mirror that here by
     // driving the SDK's own AbortController from both the caller's signal and a timer.
+    //
+    // The timer measures IDLE time, not total duration: it is re-armed on every message,
+    // so a long-but-healthy agent run is never cut off, while one that has stopped
+    // producing output is aborted after `timeout` of silence. A total-duration cap would
+    // be wrong here — unlike the other adapters, the SDK path is Claude's primary path
+    // (the CLI is only a fallback), so capping it at cliTimeout (5 min by default) would
+    // kill ordinary multi-step work. Idle is also what the message below promises.
     const sdkAbort = new AbortController();
-    const abortTimer = opts.timeout
-      ? setTimeout(() => sdkAbort.abort(), opts.timeout)
-      : null;
+    let abortTimer: ReturnType<typeof setTimeout> | null = null;
+    const armIdleTimeout = (): void => {
+      if (!opts.timeout) return;
+      if (abortTimer) clearTimeout(abortTimer);
+      abortTimer = setTimeout(() => sdkAbort.abort(), opts.timeout);
+    };
     const forwardAbort = () => sdkAbort.abort();
     opts.signal?.addEventListener('abort', forwardAbort, { once: true });
     sdkOpts.abortController = sdkAbort;
+    // A signal that was already aborted before we subscribed never fires the listener.
+    if (opts.signal?.aborted) sdkAbort.abort();
+    armIdleTimeout();
 
     log.debug(`[claude/sdk] effort=${settings.effort} mode=${settings.mode} msgMode=${msgMode} resume=${sid || 'none'} timeout=${opts.timeout ?? 'none'}`);
 
@@ -325,9 +338,10 @@ export class ClaudeAdapter implements CLIAdapter {
         prompt,
         options: sdkOpts as Parameters<typeof query>[0]['options'],
       })) {
-          if (opts.signal?.aborted) {
-            return { text: '已取消', error: true };
-          }
+        if (opts.signal?.aborted) {
+          return { text: '已取消', error: true };
+        }
+        armIdleTimeout();
 
         const msg = message as Record<string, unknown>;
 
@@ -399,7 +413,7 @@ export class ClaudeAdapter implements CLIAdapter {
       // Timed out: return a result rather than throwing, so execute() does NOT retry via
       // the CLI path — that would make the user wait a second full timeout.
       const mins = Math.round((opts.timeout ?? 0) / 60000);
-      log.warn(`[claude/sdk] 执行超时 (${opts.timeout}ms)，已中止`);
+      log.warn(`[claude/sdk] 空闲超时 (${opts.timeout}ms 无消息)，已中止`);
       return {
         text: `执行超时（${mins} 分钟无响应），已自动中止。\n可能是某个命令在等待输入（如 sudo 密码）。`,
         duration: Date.now() - start,

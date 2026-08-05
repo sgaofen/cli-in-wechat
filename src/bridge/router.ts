@@ -18,8 +18,12 @@ interface PendingQuestion { resolve: (answer: string) => void; timeout: ReturnTy
 /** Built fresh per call: a shared /g regex carries lastIndex state across calls. */
 const sendFileMarkerRegex = (): RegExp => /\[SEND_FILE:\s*([^\]]+)\]/g;
 
+/** Longest partial `[SEND_FILE: …` head we will hold back waiting for its closing `]`.
+ *  Bounded so a marker that never terminates cannot buffer a whole response. */
+const MAX_MARKER_CARRY = 256;
+
 /**
- * Strip `[SEND_FILE: …]` markers from text that is about to be streamed to WeChat.
+ * Build a stripper for `[SEND_FILE: …]` markers in text about to be streamed to WeChat.
  *
  * parseAndSendFiles() removes these markers, but only from the FINAL consolidated
  * response. In normal/verbose msgMode the text is also pushed to WeChat as it streams,
@@ -27,14 +31,26 @@ const sendFileMarkerRegex = (): RegExp => /\[SEND_FILE:\s*([^\]]+)\]/g;
  * marker is almost always the last thing in a response, nothing arrives to interrupt the
  * 2.5s flush debounce, making the leak reliably reproducible rather than a rare race.
  *
- * Also drops a trailing unterminated `[SEND_FILE: …` fragment in case a marker is ever
- * split across two streamed blocks.
+ * Stateful because a marker can straddle two streamed blocks: an unterminated head is
+ * held back and rejoined with the next block, so neither half reaches the chat. If the
+ * closing `]` never arrives the head is dropped rather than emitted — the marker is a
+ * token we inject ourselves, so a run-on `[SEND_FILE:` is a broken marker, not prose.
+ *
+ * One stripper per request; do not share across users.
  */
-function stripSendFileMarkers(text: string): string {
-  return text
-    .replace(sendFileMarkerRegex(), '')
-    .replace(/\[SEND_FILE:[^\]]*$/, '')
-    .trim();
+export function createSendFileMarkerStripper(): (text: string) => string {
+  let carry = '';
+  return (text: string): string => {
+    const combined = carry + text;
+    carry = '';
+    let out = combined.replace(sendFileMarkerRegex(), '');
+    const head = /\[SEND_FILE:[^\]]*$/.exec(out);
+    if (head) {
+      out = out.slice(0, head.index);
+      if (head[0].length <= MAX_MARKER_CARRY) carry = head[0];
+    }
+    return out.trim();
+  };
 }
 
 const TOOL_ALIASES: Record<string, string> = {
@@ -1245,6 +1261,8 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     // Keep text/thinking and tool activity as two independent streams.
     // This allows tool blocks to be sent as standalone messages while preserving order.
     const textLines: string[] = [];
+    // Per-request: carries a marker head that straddles two streamed blocks.
+    const stripSendFileMarkers = createSendFileMarkerStripper();
     const activityLines: string[] = [];
     const finalActivityLines: string[] = [];
     let textFlushTimer: ReturnType<typeof setTimeout> | null = null;
