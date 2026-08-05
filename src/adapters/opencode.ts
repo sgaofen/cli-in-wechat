@@ -22,13 +22,19 @@ export function resolveBareModelFromList(model: string, availableModels: string[
   return preferred || raw;
 }
 
+export function resolveMiniMaxThinkingVariant(model: string, effort: string): string | undefined {
+  const modelId = model.trim().replace(/\/+$/, '').split('/').pop()?.toLowerCase();
+  if (modelId !== 'minimax-m3') return undefined;
+  return effort.trim().toLowerCase() === 'low' ? 'none' : 'thinking';
+}
+
 export class OpenCodeAdapter implements CLIAdapter {
   readonly name = 'opencode';
   readonly displayName = 'OpenCode';
   readonly command = 'opencode';
   readonly capabilities: AdapterCapabilities = {
     streaming: false, jsonOutput: true, sessionResume: true,
-    modes: ['auto', 'safe', 'plan'], hasEffort: false, hasModel: true, hasSearch: false, hasBudget: false,
+    modes: ['auto', 'safe', 'plan'], hasEffort: true, hasModel: true, hasSearch: false, hasBudget: false,
   };
 
   async isAvailable(): Promise<boolean> { return commandExists(this.command); }
@@ -86,6 +92,8 @@ private resolveModelArg(model: string, workDir?: string): string {
       if (settings.model) {
         const resolvedModel = this.resolveModelArg(settings.model, settings.workDir || opts.workDir);
         args.push('-m', resolvedModel);
+        const variant = resolveMiniMaxThinkingVariant(resolvedModel, settings.effort);
+        if (variant) args.push('--variant', variant);
       }
 
       const sid = settings.sessionIds[this.name];
@@ -95,7 +103,7 @@ private resolveModelArg(model: string, workDir?: string): string {
 
       if (opts.extraArgs) args.push(...opts.extraArgs);
 
-      log.debug(`[opencode] executing: run --format json --thinking`);
+      log.debug(`[opencode] executing: ${args.join(' ')}`);
 
       const proc = spawnCli(this.command, args, {
         cwd: settings.workDir || opts.workDir,
