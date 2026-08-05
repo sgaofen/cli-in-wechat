@@ -15,6 +15,28 @@ import type { DownloadedMedia } from '../utils/media.js';
 interface ActiveTask { abort: AbortController; tool: string }
 interface PendingQuestion { resolve: (answer: string) => void; timeout: ReturnType<typeof setTimeout>; toolName: string }
 
+/** Built fresh per call: a shared /g regex carries lastIndex state across calls. */
+const sendFileMarkerRegex = (): RegExp => /\[SEND_FILE:\s*([^\]]+)\]/g;
+
+/**
+ * Strip `[SEND_FILE: …]` markers from text that is about to be streamed to WeChat.
+ *
+ * parseAndSendFiles() removes these markers, but only from the FINAL consolidated
+ * response. In normal/verbose msgMode the text is also pushed to WeChat as it streams,
+ * which bypasses that strip entirely — so the raw marker leaked into the chat. Since the
+ * marker is almost always the last thing in a response, nothing arrives to interrupt the
+ * 2.5s flush debounce, making the leak reliably reproducible rather than a rare race.
+ *
+ * Also drops a trailing unterminated `[SEND_FILE: …` fragment in case a marker is ever
+ * split across two streamed blocks.
+ */
+function stripSendFileMarkers(text: string): string {
+  return text
+    .replace(sendFileMarkerRegex(), '')
+    .replace(/\[SEND_FILE:[^\]]*$/, '')
+    .trim();
+}
+
 const TOOL_ALIASES: Record<string, string> = {
   claude: 'claude', cc: 'claude',
   codex: 'codex', cx: 'codex',
@@ -1283,15 +1305,19 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
             scheduleTextFlush();
           }
           break;
-        case 'text':
-          if (content) {
+        case 'text': {
+          // Markers must not reach WeChat: the final text gets them stripped by
+          // parseAndSendFiles, but streamed chunks never pass through it.
+          const visible = content ? stripSendFileMarkers(content) : '';
+          if (visible) {
             hasStreamedText = true;
             // Boundary: flush pending activity first, then append text.
             flushActivityBatch();
-            textLines.push(content);
+            textLines.push(visible);
             scheduleTextFlush();
           }
           break;
+        }
         case 'tool_result':
           if (msgMode === 'verbose' && content) {
             flushTextBatch();
@@ -1316,7 +1342,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       }
 
       // Parse [SEND_FILE: path] markers and send files
-      const { text: cleanText, sentFiles } = await this.parseAndSendFiles(uid, result.text);
+      const { text: cleanText, sentFiles, failedFiles } = await this.parseAndSendFiles(uid, result.text);
 
       // Store for >> relay; auto-switch defaultTool to last used tool
       this.lastResponse.set(uid, { tool: adapter.displayName, text: cleanText });
@@ -1327,9 +1353,10 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         await this.ilink.sendText(uid, `💭 思考:\n${result.thinking}\n\n---`);
       }
 
-      const sentNotice = sentFiles.length > 0
-        ? `\n[已发送文件: ${sentFiles.join(', ')}]`
-        : '';
+      const sentNotice = [
+        sentFiles.length > 0 ? `\n[已发送文件: ${sentFiles.join(', ')}]` : '',
+        failedFiles.length > 0 ? `\n[⚠️ 文件发送失败: ${failedFiles.join('; ')}]` : '',
+      ].join('');
 
       const splitActivitySent = msgMode === 'normal' && finalActivityLines.length > 0
         ? await this.sendNormalActivityBatches(uid, finalActivityLines)
@@ -1370,10 +1397,16 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     }
   }
 
-  private async parseAndSendFiles(uid: string, text: string): Promise<{ text: string; sentFiles: string[] }> {
+  private async parseAndSendFiles(
+    uid: string,
+    text: string,
+  ): Promise<{ text: string; sentFiles: string[]; failedFiles: string[] }> {
     const { existsSync } = await import('node:fs');
     const sentFiles: string[] = [];
-    const regex = /\[SEND_FILE:\s*([^\]]+)\]/g;
+    // Failures used to be log-only, so a file that never sent looked identical to a
+    // successful one from inside WeChat. Collect them and report back to the user.
+    const failedFiles: string[] = [];
+    const regex = sendFileMarkerRegex();
     let match;
     const workDir = this.sessions.get(uid).workDir || this.config.workDir;
 
@@ -1385,9 +1418,12 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         filePath = join(workDir, filePath);
       }
 
+      const baseName = filePath.split(/[\\/]/).pop() || filePath;
+
       try {
         if (!existsSync(filePath)) {
           log.warn(`[SEND_FILE] 文件不存在: ${filePath}`);
+          failedFiles.push(`${baseName}（文件不存在）`);
           continue;
         }
 
@@ -1399,15 +1435,16 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         } else {
           await this.ilink.sendFile(uid, filePath);
         }
-        sentFiles.push(filePath.split(/[\\/]/).pop() || filePath);
+        sentFiles.push(baseName);
         log.info(`[SEND_FILE] 已发送: ${filePath}`);
       } catch (err) {
         log.error(`[SEND_FILE] 发送失败: ${filePath}`, err);
+        failedFiles.push(`${baseName}（${(err as Error).message || '未知错误'}）`);
       }
     }
 
     // 移除标记
-    const cleanText = text.replace(regex, '').trim();
-    return { text: cleanText, sentFiles };
+    const cleanText = text.replace(sendFileMarkerRegex(), '').trim();
+    return { text: cleanText, sentFiles, failedFiles };
   }
 }

@@ -288,7 +288,25 @@ export class ClaudeAdapter implements CLIAdapter {
       };
     }
 
-    log.debug(`[claude/sdk] effort=${settings.effort} mode=${settings.mode} msgMode=${msgMode} resume=${sid || 'none'}`);
+    // Timeout + cancellation for the SDK path.
+    //
+    // The `opts.signal?.aborted` check inside the loop below only runs when a message
+    // arrives, so a query that produces nothing — e.g. a tool call blocked on an
+    // interactive prompt such as `sudo` waiting for a password — hangs the loop forever.
+    // The router keeps its per-user `active` lock for the whole call, so one stuck query
+    // silently wedges the bridge for that user until the process restarts (observed: 8h37m).
+    //
+    // The CLI fallback already bounds itself via setupTimeout(); mirror that here by
+    // driving the SDK's own AbortController from both the caller's signal and a timer.
+    const sdkAbort = new AbortController();
+    const abortTimer = opts.timeout
+      ? setTimeout(() => sdkAbort.abort(), opts.timeout)
+      : null;
+    const forwardAbort = () => sdkAbort.abort();
+    opts.signal?.addEventListener('abort', forwardAbort, { once: true });
+    sdkOpts.abortController = sdkAbort;
+
+    log.debug(`[claude/sdk] effort=${settings.effort} mode=${settings.mode} msgMode=${msgMode} resume=${sid || 'none'} timeout=${opts.timeout ?? 'none'}`);
 
     let resultText = '';
     let thinking = '';
@@ -302,75 +320,94 @@ export class ClaudeAdapter implements CLIAdapter {
     // Track pending tool_use to associate with tool_result
     let pendingToolName: string | undefined;
 
-    for await (const message of query({
-      prompt,
-      options: sdkOpts as Parameters<typeof query>[0]['options'],
-    })) {
-      if (opts.signal?.aborted) {
-        return { text: '已取消', error: true };
-      }
+    try {
+      for await (const message of query({
+        prompt,
+        options: sdkOpts as Parameters<typeof query>[0]['options'],
+      })) {
+          if (opts.signal?.aborted) {
+            return { text: '已取消', error: true };
+          }
 
-      const msg = message as Record<string, unknown>;
+        const msg = message as Record<string, unknown>;
 
-      if (msg.type === 'assistant') {
-        // SDK 用 message.content 存储 content blocks
-        const msgObj = msg as any;
-        const content = msgObj.content || msgObj.message?.content;
-        if (content) {
-          for (const block of content) {
-            if (block.type === 'thinking' && block.thinking) {
-              thinking += block.thinking;
-              if (streamIntermediate) {
-                onIntermediate({ type: 'thinking', content: block.thinking });
+        if (msg.type === 'assistant') {
+          // SDK 用 message.content 存储 content blocks
+          const msgObj = msg as any;
+          const content = msgObj.content || msgObj.message?.content;
+          if (content) {
+            for (const block of content) {
+              if (block.type === 'thinking' && block.thinking) {
+                thinking += block.thinking;
+                if (streamIntermediate) {
+                  onIntermediate({ type: 'thinking', content: block.thinking });
+                }
               }
-            }
-            if (block.type === 'text' && block.text) {
-              // Intermediate text output
-              if (streamIntermediate && block.text.trim()) {
-                onIntermediate({ type: 'text', content: block.text });
+              if (block.type === 'text' && block.text) {
+                // Intermediate text output
+                if (streamIntermediate && block.text.trim()) {
+                  onIntermediate({ type: 'text', content: block.text });
+                }
               }
-            }
-            if (block.type === 'tool_use') {
-              pendingToolName = block.name;
-              if (streamIntermediate) {
-                onIntermediate({
-                  type: 'tool_use',
-                  content: summarizeToolUse(block.name || 'Tool', block.input),
-                  toolName: block.name,
-                });
+              if (block.type === 'tool_use') {
+                pendingToolName = block.name;
+                if (streamIntermediate) {
+                  onIntermediate({
+                    type: 'tool_use',
+                    content: summarizeToolUse(block.name || 'Tool', block.input),
+                    toolName: block.name,
+                  });
+                }
               }
             }
           }
         }
-      }
 
-      if (msg.type === 'user') {
-        // SDK 用 message.content 存储 tool_result
-        const msgObj = msg as any;
-        const content = msgObj.content || msgObj.message?.content;
-        if (content && streamIntermediate) {
-          for (const block of content) {
-            if (block.type === 'tool_result' && block.content) {
-              const summary = summarizeToolResult(pendingToolName, block.content);
-              if (summary) {
-                onIntermediate({
-                  type: 'tool_result',
-                  content: summary,
-                  toolName: pendingToolName,
-                });
+        if (msg.type === 'user') {
+          // SDK 用 message.content 存储 tool_result
+          const msgObj = msg as any;
+          const content = msgObj.content || msgObj.message?.content;
+          if (content && streamIntermediate) {
+            for (const block of content) {
+              if (block.type === 'tool_result' && block.content) {
+                const summary = summarizeToolResult(pendingToolName, block.content);
+                if (summary) {
+                  onIntermediate({
+                    type: 'tool_result',
+                    content: summary,
+                    toolName: pendingToolName,
+                  });
+                }
+                pendingToolName = undefined;
               }
-              pendingToolName = undefined;
             }
           }
         }
-      }
 
-      if (msg.type === 'result') {
-        const result = msg as Record<string, unknown>;
-        resultText = (result.result as string) || '(无输出)';
-        sessionId = result.session_id as string;
-        error = !!(result.is_error) || result.subtype !== 'success';
+        if (msg.type === 'result') {
+          const result = msg as Record<string, unknown>;
+          resultText = (result.result as string) || '(无输出)';
+          sessionId = result.session_id as string;
+          error = !!(result.is_error) || result.subtype !== 'success';
+        }
       }
+    } catch (err) {
+      // Only our own abort lands here as a non-error outcome; anything else is a real
+      // failure and must propagate so execute() can fall back to the CLI path.
+      if (!sdkAbort.signal.aborted) throw err;
+      if (opts.signal?.aborted) return { text: '已取消', error: true };
+      // Timed out: return a result rather than throwing, so execute() does NOT retry via
+      // the CLI path — that would make the user wait a second full timeout.
+      const mins = Math.round((opts.timeout ?? 0) / 60000);
+      log.warn(`[claude/sdk] 执行超时 (${opts.timeout}ms)，已中止`);
+      return {
+        text: `执行超时（${mins} 分钟无响应），已自动中止。\n可能是某个命令在等待输入（如 sudo 密码）。`,
+        duration: Date.now() - start,
+        error: true,
+      };
+    } finally {
+      if (abortTimer) clearTimeout(abortTimer);
+      opts.signal?.removeEventListener('abort', forwardAbort);
     }
 
     return {
