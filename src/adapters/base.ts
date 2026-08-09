@@ -54,7 +54,7 @@ export const DEFAULT_SETTINGS: UserSettings = {
   systemPrompt: '',
   workDir: '',
   effort: 'high',
-  maxTurns: 30,
+  maxTurns: 100,
   maxBudget: 0,
   allowedTools: '',
   disallowedTools: '',

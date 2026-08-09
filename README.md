@@ -202,15 +202,16 @@ Claude Code 需要你做选择时，问题自动转发到微信：
   "defaultTool": "claude",
   "workDir": "/Users/you",
   "cliTimeout": 300000,
-  "allowedUsers": [],        // 见下方「安全」说明，留空 = 任何人可控制
+  "allowedUsers": [],        // 留空时仅允许当前扫码登录用户
+  "allowAllUsers": false,    // 仅在明确需要公开访问时设为 true
   "tools": {
     "claude": { "args": ["--max-turns", "50"] }
   }
 }
 ```
 
-> **安全：`allowedUsers` 留空意味着任何能私聊机器人的微信好友都能以完整权限运行 CLI。**
-> 建议填入你自己的 `ilink_user_id`（启动日志会提示）。
+> **安全：默认只允许当前扫码登录用户。** 如需增加管理员，请填写 `allowedUsers`；
+> 只有显式设置 `allowAllUsers: true` 才会允许任意好友以完整权限运行 CLI。
 
 ## 网络与代理（故障排查）
 
