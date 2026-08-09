@@ -40,19 +40,28 @@ export interface BridgeConfig {
   cliTimeout: number;
   typingInterval: number;
   allowedUsers: string[];
+  allowAllUsers: boolean;
   workDir: string;
   tools: Record<string, ToolConfig>;
 }
 
+export const DEFAULT_MAX_RESPONSE_CHUNK_BYTES = 3_800;
+
 const DEFAULT_CONFIG: BridgeConfig = {
   defaultTool: 'claude',
-  maxResponseChunkSize: 2000,
+  maxResponseChunkSize: DEFAULT_MAX_RESPONSE_CHUNK_BYTES,
   cliTimeout: 300_000,      // 5 minutes
   typingInterval: 5_000,    // 5 seconds
-  allowedUsers: [],          // empty = allow all
+  allowedUsers: [],
+  allowAllUsers: false,
   workDir: process.cwd(),
   tools: {},
 };
+
+export function resolveAllowedUsers(config: BridgeConfig, authenticatedUserId: string): string[] {
+  if (config.allowedUsers.length > 0 || config.allowAllUsers) return [...config.allowedUsers];
+  return authenticatedUserId ? [authenticatedUserId] : [];
+}
 
 export function ensureDataDir(): void {
   mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });

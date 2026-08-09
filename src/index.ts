@@ -9,9 +9,15 @@ import {
   loadCredentials,
   saveCredentials,
   ensureDataDir,
+  resolveAllowedUsers,
+  DATA_DIR,
 } from './config.js';
 import { log, setLogLevel, LogLevel } from './utils/logger.js';
 import { initProxyFromEnv } from './utils/http.js';
+import { acquireSingleInstance } from './utils/single-instance.js';
+import { join } from 'node:path';
+
+let releaseInstance: (() => Promise<void>) | null = null;
 
 async function main() {
   const subcommand = process.argv[2];
@@ -31,6 +37,8 @@ async function main() {
   );
 
   ensureDataDir();
+  const instance = await acquireSingleInstance(join(DATA_DIR, 'bridge.lock'));
+  releaseInstance = instance.release;
   const config = loadConfig();
 
   if (process.argv.includes('--debug') || process.argv.includes('-d')) {
@@ -84,14 +92,27 @@ async function main() {
     log.info('使用已保存的登录凭据');
   }
 
-  if (config.allowedUsers.length === 0) {
+  const defaultedToOwner = config.allowedUsers.length === 0 && !config.allowAllUsers;
+  config.allowedUsers = resolveAllowedUsers(config, credentials.ilinkUserId);
+  if (config.allowAllUsers) {
     log.warn('⚠️ allowedUsers 为空：任何能私聊机器人的微信好友都可运行 CLI（拥有完整权限）。');
-    log.warn('   如需限制，请在 ~/.wx-ai-bridge/config.json 设置 allowedUsers: ["<你的 ilink_user_id>"]');
+    log.warn('   关闭 allowAllUsers，或在 ~/.wx-ai-bridge/config.json 设置 allowedUsers 白名单。');
+  } else if (defaultedToOwner) {
+    log.info('allowedUsers 未配置：已安全限制为当前扫码登录用户。');
   }
 
   // ─── 3. Start bridge ─────────────────────────────────
 
-  const ilink = new ILinkClient(credentials);
+  const ilink = new ILinkClient(credentials, {
+    maxTextBytes: config.maxResponseChunkSize,
+  });
+  instance.setRequestHandler(async (request) => {
+    const value = request as { type?: unknown; userId?: unknown; text?: unknown };
+    if (value?.type !== 'send-text' || typeof value.userId !== 'string' || typeof value.text !== 'string') {
+      throw new Error('invalid local bridge request');
+    }
+    return ilink.sendText(value.userId, value.text);
+  });
   const sessions = new SessionManager();
   const router = new Router(ilink, registry, sessions, config);
 
@@ -119,6 +140,8 @@ async function main() {
     log.info(`收到 ${signal}，正在关闭...`);
     try { router.stop(); } catch { /* ignore */ }
     try { ilink.stop(); } catch { /* ignore */ }
+    void releaseInstance?.();
+    releaseInstance = null;
     // Give in-flight aborts (child SIGTERM/taskkill) a brief moment, then exit.
     setTimeout(() => process.exit(0), 300);
   };
@@ -138,12 +161,16 @@ async function main() {
       shuttingDown = true;
       try { router.stop(); } catch { /* ignore */ }
       try { ilink.stop(); } catch { /* ignore */ }
+      void releaseInstance?.();
+      releaseInstance = null;
     }
     setTimeout(() => process.exit(1), 200);
   });
 }
 
 main().catch(async (err) => {
+  await releaseInstance?.();
+  releaseInstance = null;
   const { isRetryableNetworkError, describeNetworkError } = await import('./utils/http.js');
   if (isRetryableNetworkError(err) || /ECONNRESET|fetch failed|网络请求/.test(String(err?.message))) {
     log.error('启动失败 (网络问题):');

@@ -2,21 +2,36 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { Router, createSendFileMarkerStripper } from '../src/bridge/router.js';
+import { DeliveryFinalizationError } from '../src/ilink/client.js';
+import { DEFAULT_SETTINGS } from '../src/adapters/base.js';
 import type { BridgeConfig } from '../src/config.js';
 import type { WeixinMessage } from '../src/ilink/types.js';
 
 function createRouter() {
-  const messages: Array<{ uid: string; text: string }> = [];
+  const messages: Array<{ uid: string; text: string; options?: { priority?: string; generation?: number } }> = [];
   const starts: string[] = [];
+  const stops: string[] = [];
+  const recoveries: string[] = [];
+  const deliveryEvents: string[] = [];
 
   const ilink = {
-    sendText: async (uid: string, text: string) => {
-      messages.push({ uid, text });
+    sendText: async (uid: string, text: string, options?: { priority?: string; generation?: number }) => {
+      messages.push({ uid, text, options });
     },
     startTyping: async (uid: string) => {
       starts.push(uid);
-      return () => {};
+      deliveryEvents.push(`start:${uid}`);
+      return () => {
+        stops.push(uid);
+        deliveryEvents.push(`stop:${uid}`);
+      };
     },
+    recoverPending: async (uid: string) => {
+      recoveries.push(uid);
+      deliveryEvents.push(`recover:${uid}`);
+      return [];
+    },
+    getDeliveryStatus: () => ({ quota: { generation: 1 }, pending: [], failed: [] }),
     onMessage: () => {},
   };
 
@@ -48,13 +63,33 @@ function createRouter() {
     cliTimeout: 300_000,
     typingInterval: 5000,
     allowedUsers: [],
+    allowAllUsers: true,
     workDir: process.cwd(),
     tools: {},
   };
 
   const router = new Router(ilink as any, registry as any, sessions as any, config);
-  return { router: router as any, messages, starts, sessions };
+  return {
+    router: router as any,
+    ilink: ilink as any,
+    messages,
+    starts,
+    stops,
+    recoveries,
+    deliveryEvents,
+    sessions,
+  };
 }
+
+test('router denies users when neither a whitelist nor public opt-in is configured', async () => {
+  const { router, messages } = createRouter();
+  router.config.allowedUsers = [];
+  router.config.allowAllUsers = false;
+
+  await router.handle(makeMessage('stranger'), 'run command', '');
+
+  assert.equal(messages.length, 0);
+});
 
 function makeMessage(uid: string): WeixinMessage {
   return {
@@ -69,6 +104,18 @@ function makeMessage(uid: string): WeixinMessage {
     item_list: [],
   };
 }
+
+test('default settings allow up to 100 turns', () => {
+  assert.equal(DEFAULT_SETTINGS.maxTurns, 100);
+});
+
+test('/reset restores the independent 100-turn default', async () => {
+  const { router, sessions } = createRouter();
+
+  await router.handleSlash('u1', '/reset');
+
+  assert.equal((sessions.get('u1') as any).maxTurns, 100);
+});
 
 test('getCli prefers @tool in text over quoted footer tool', () => {
   const { router, sessions } = createRouter();
@@ -145,6 +192,63 @@ test('handle() omits refText in combined prompt if refText is empty', async () =
   assert.equal(capturedPrompt, 'explain');
 });
 
+test('exact 继续 wraps pending outbox recovery with typing', async () => {
+  const { router, ilink, starts, stops, recoveries, deliveryEvents } = createRouter();
+  ilink.getDeliveryStatus = () => ({ quota: { generation: 1 }, pending: [{ itemId: 'pending-1' }], failed: [] });
+  let execCalled = false;
+  router.exec = async () => {
+    execCalled = true;
+  };
+
+  await router.handle(makeMessage('u1'), '  继续  ', '');
+
+  assert.deepEqual(recoveries, ['u1']);
+  assert.deepEqual(starts, ['u1']);
+  assert.deepEqual(stops, ['u1']);
+  assert.deepEqual(deliveryEvents, ['start:u1', 'recover:u1', 'stop:u1']);
+  assert.equal(execCalled, false);
+});
+
+test('exact 继续 with an empty outbox reaches the Agent as an ordinary prompt', async () => {
+  const { router, starts, recoveries } = createRouter();
+  let capturedPrompt = '';
+  router.exec = async (_uid: string, _tool: string, prompt: string) => {
+    capturedPrompt = prompt;
+  };
+
+  await router.handle(makeMessage('u1'), '继续', '');
+
+  assert.deepEqual(starts, []);
+  assert.deepEqual(recoveries, ['u1']);
+  assert.equal(capturedPrompt, '继续');
+});
+
+test('ordinary text still reaches the adapter after recovery is attempted', async () => {
+  const { router, recoveries } = createRouter();
+  let capturedPrompt = '';
+  router.exec = async (_uid: string, _tool: string, prompt: string) => {
+    capturedPrompt = prompt;
+  };
+
+  await router.handle(makeMessage('u1'), 'new question', '');
+
+  assert.deepEqual(recoveries, ['u1']);
+  assert.equal(capturedPrompt, 'new question');
+});
+
+test('/status exposes the configured delivery window limit', async () => {
+  const { router, messages } = createRouter();
+  (router as any).ilink.getDeliveryStatus = () => ({
+    quota: { sentItems: 2, remainingItems: 1, maxItemsPerWindow: 3, rateBackoffUntil: 0 },
+    pending: [{ itemId: 'pending-1' }],
+    failed: [{ itemId: 'failed-1' }],
+  });
+
+  await router.handleSlash('u1', '/status');
+
+  assert.match(messages.at(-1)?.text || '', /delivery: pending=1 failed=1 sent=2\/3 remaining=1 ready/);
+});
+
 test('handleSlash /model strips accidental /. suffix from model name', async () => {
   const { router, sessions, messages } = createRouter();
 
@@ -208,6 +312,119 @@ test('sendNormalActivityBatches waits 5 seconds between oversized batches', asyn
   const activityMessages = messages.filter((m) => m.text.startsWith('Activity'));
   assert.ok(activityMessages.length > 1);
   assert.deepEqual(delays, Array(activityMessages.length - 1).fill(5000));
+});
+
+test('exec tags streamed answer text as intermediate and tool activity as activity', async () => {
+  const { router, sessions, messages } = createRouter();
+  sessions.update('u1', { msgMode: 'verbose' } as any);
+  (router as any).registry.get = () => ({
+    name: 'codex',
+    displayName: 'Codex',
+    capabilities: { sessionResume: false },
+    execute: async (_prompt: string, options: any) => {
+      options.onIntermediate({ type: 'text', content: 'answer progress' });
+      options.onIntermediate({ type: 'tool_use', content: '- Shell Command: pwd' });
+      return { text: 'answer progress', error: false };
+    },
+  });
+
+  await router.exec('u1', 'codex', 'hello');
+
+  assert.equal(messages.find((message) => message.text === 'answer progress')?.options?.priority, 'intermediate');
+  assert.equal(messages.find((message) => message.text.startsWith('Activity'))?.options?.priority, 'activity');
+  assert.equal(messages.at(-1)?.options?.priority, 'final');
+});
+
+test('exec does not send a failure bubble after confirmed delivery bookkeeping fails', async () => {
+  const { router, ilink } = createRouter();
+  const attempts: string[] = [];
+  ilink.sendText = async (_uid: string, text: string) => {
+    attempts.push(text);
+    if (attempts.length === 1) {
+      throw new DeliveryFinalizationError('final-1', new Error('quota write failed'));
+    }
+  };
+  (router as any).registry.get = () => ({
+    name: 'codex',
+    displayName: 'Codex',
+    capabilities: { sessionResume: false },
+    execute: async () => ({ text: 'already visible result', error: false }),
+  });
+
+  await router.exec('u1', 'codex', 'hello');
+
+  assert.equal(attempts.length, 1);
+  assert.doesNotMatch(attempts[0], /^失败:/);
+});
+
+test('chain does not send a failure bubble after confirmed delivery bookkeeping fails', async () => {
+  const { router, ilink } = createRouter();
+  const attempts: string[] = [];
+  ilink.sendText = async (_uid: string, text: string) => {
+    attempts.push(text);
+    if (attempts.length === 1) {
+      throw new DeliveryFinalizationError('chain-final-1', new Error('outbox ack failed'));
+    }
+  };
+  (router as any).registry.get = (name: string) => ({
+    name,
+    displayName: name,
+    capabilities: { sessionResume: false },
+    execute: async () => ({ text: `${name} result`, error: false }),
+  });
+
+  await router.chain('u1', 'codex', 'gemini', 'hello');
+
+  assert.equal(attempts.length, 1);
+  assert.doesNotMatch(attempts[0], /^链式调用失败:/);
+});
+
+test('confirmed thinking bookkeeping failure does not suppress the final answer', async () => {
+  const { router, ilink, sessions } = createRouter();
+  sessions.update('u1', { msgMode: 'compact', showThoughts: true } as any);
+  const attempts: string[] = [];
+  ilink.sendText = async (_uid: string, text: string) => {
+    attempts.push(text);
+    if (attempts.length === 1) {
+      throw new DeliveryFinalizationError('thinking-1', new Error('thinking ack failed'));
+    }
+  };
+  (router as any).registry.get = () => ({
+    name: 'codex',
+    displayName: 'Codex',
+    capabilities: { sessionResume: false },
+    execute: async () => ({ text: 'actual final answer', thinking: 'visible thinking', error: false }),
+  });
+
+  await router.exec('u1', 'codex', 'hello');
+
+  assert.equal(attempts.length, 2);
+  assert.match(attempts[0], /visible thinking/);
+  assert.match(attempts[1], /actual final answer/);
+  assert.doesNotMatch(attempts[1], /^失败:/);
+});
+
+test('handle snapshots task generation before awaiting outbox recovery', async () => {
+  const { router, ilink, messages } = createRouter();
+  let generation = 1;
+  let finishRecovery!: () => void;
+  ilink.getDeliveryStatus = () => ({ quota: { generation } });
+  ilink.recoverPending = () => new Promise<void>((resolve) => {
+    finishRecovery = resolve;
+  });
+  (router as any).registry.get = () => ({
+    name: 'codex',
+    displayName: 'Codex',
+    capabilities: { sessionResume: false },
+    execute: async () => ({ text: 'older final', error: false }),
+  });
+
+  const handling = router.handle(makeMessage('u1'), '@codex older task', '');
+  generation = 2;
+  finishRecovery();
+  await handling;
+
+  assert.equal(messages.at(-1)?.options?.generation, 1);
 });
 
 test('exec sanitizes stale malformed model before adapter execution', async () => {
