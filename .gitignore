@@ -5,6 +5,7 @@ dist/
 
 # Runtime data
 .wx-ai-bridge/
+.wx-media/
 
 # IDE / editor config
 .vscode/
