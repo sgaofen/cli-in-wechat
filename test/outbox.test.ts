@@ -424,6 +424,116 @@ test('normalizes an already-wrapped schema-two failure snapshot once', () => {
   assert.deepEqual(reloaded.listPending('user-a', 'account-a'), pending);
 });
 
+test('migrates legacy failures conservatively and only once', () => {
+  const filePath = tempPath();
+  const now = 50_000;
+  const base = {
+    schemaVersion: 2,
+    kind: 'text',
+    accountId: 'account-a',
+    userId: 'user-a',
+    generation: 1,
+    tokenVersion: 1,
+    priority: 'final',
+    bytes: 4,
+    createdAt: 1_000,
+    expiresAt: 60_000,
+  };
+  writeFileSync(filePath, JSON.stringify({
+    schemaVersion: 2,
+    revision: 7,
+    nextSequence: 4,
+    items: [
+      {
+        ...base,
+        itemId: 'legacy-terminal',
+        clientId: 'legacy-terminal-client',
+        sequence: 1,
+        text: 'old1',
+        state: 'permanent-failure',
+      },
+      {
+        ...base,
+        itemId: 'legacy-recovery',
+        clientId: 'legacy-recovery-client',
+        sequence: 2,
+        text: 'old2',
+        state: 'pending',
+        recoveryRequired: true,
+        terminalError: { errmsg: 'unknown delivery outcome' },
+      },
+      {
+        ...base,
+        itemId: 'current-terminal',
+        clientId: 'current-terminal-client',
+        sequence: 3,
+        text: 'new3',
+        state: 'permanent-failure',
+        failureKind: 'deterministic-rejection',
+        failedAt: 40_000,
+        recoveryAttempts: 2,
+      },
+    ],
+  }));
+
+  const migrated = new OutboxStore(filePath, { now: () => now });
+  const legacyTerminal = migrated.get('legacy-terminal');
+  assert.equal(legacyTerminal?.failureKind, 'legacy-unknown');
+  assert.equal(legacyTerminal?.failedAt, now);
+  assert.equal(legacyTerminal?.recoveryAttempts, 0);
+  const legacyRecovery = migrated.get('legacy-recovery');
+  assert.equal(legacyRecovery?.state, 'permanent-failure');
+  assert.equal(legacyRecovery?.failureKind, 'ambiguous-delivery');
+  assert.equal(legacyRecovery?.failedAt, now);
+  assert.equal(legacyRecovery?.recoveryRequired, undefined);
+  assert.deepEqual(legacyRecovery?.terminalError, { errmsg: 'unknown delivery outcome' });
+  assert.deepEqual(
+    {
+      failureKind: migrated.get('current-terminal')?.failureKind,
+      failedAt: migrated.get('current-terminal')?.failedAt,
+      recoveryAttempts: migrated.get('current-terminal')?.recoveryAttempts,
+    },
+    { failureKind: 'deterministic-rejection', failedAt: 40_000, recoveryAttempts: 2 },
+  );
+
+  const migratedText = readFileSync(filePath, 'utf8');
+  assert.equal(JSON.parse(migratedText).revision, 8);
+  new OutboxStore(filePath, { now: () => now });
+  assert.equal(readFileSync(filePath, 'utf8'), migratedText);
+});
+
+test('rejects malformed terminal metadata before migration persistence', async (t) => {
+  for (const { name, field, value } of [
+    { name: 'unknown failure kind', field: 'failureKind', value: 'network-ish' },
+    { name: 'negative failed time', field: 'failedAt', value: -1 },
+    { name: 'non-finite failed time', field: 'failedAt', value: Number.POSITIVE_INFINITY },
+    { name: 'fractional recovery attempts', field: 'recoveryAttempts', value: 1.5 },
+    { name: 'negative recovery attempts', field: 'recoveryAttempts', value: -1 },
+  ] as const) {
+    await t.test(name, () => {
+      const filePath = tempPath();
+      const item = {
+        ...schemaTwoFailureFixture().items[13],
+        state: 'permanent-failure',
+        failureKind: 'deterministic-rejection',
+        failedAt: 10,
+        recoveryAttempts: 0,
+        [field]: value,
+      };
+      const snapshot = {
+        schemaVersion: 2,
+        revision: 1,
+        nextSequence: Number(item.sequence) + 1,
+        items: [item],
+      };
+      const original = JSON.stringify(snapshot, null, 2);
+      writeFileSync(filePath, original);
+
+      assertMigrationRejectedWithoutWrite(filePath, original);
+    });
+  }
+});
+
 test('normalizes the incident final run behind same-generation low-priority items', () => {
   const filePath = tempPath();
   const fixture = schemaTwoMixedFailureFixture();
@@ -926,11 +1036,12 @@ test('enforces the byte ceiling per safe record while preserving frozen records'
 
       const store = new OutboxStore(filePath, migrationOptions());
       const loaded = store.list();
-      const expectsWrite = fixture.items.some((item) => item.state === 'pending'
+      const expectsWrite = fixture.items.some((item) => item.recoveryRequired === true
+        || (item.state === 'pending'
         && !item.deliveryReceipt
         && !item.recoveryRequired
         && !item.continuationNoticeAttached
-        && Buffer.byteLength(String(item.text), 'utf8') > MIGRATED_BODY_BYTES);
+        && Buffer.byteLength(String(item.text), 'utf8') > MIGRATED_BODY_BYTES));
 
       fixture.items.forEach((item, index) => {
         const start = loaded.findIndex((candidate) => candidate.itemId === item.itemId);
@@ -955,9 +1066,18 @@ test('enforces the byte ceiling per safe record while preserving frozen records'
           assert.equal(records[0].clientId, item.clientId);
         } else {
           assert.equal(records.length, 1);
-          assert.deepEqual(stableMigrationFields(records[0]), stableMigrationFields(item));
+          if (item.recoveryRequired === true) {
+            assert.deepEqual(stableMigrationFields(records[0]), {
+              ...stableMigrationFields(item),
+              state: 'permanent-failure',
+            });
+            assert.equal(records[0].failureKind, 'ambiguous-delivery');
+            assert.equal(records[0].recoveryRequired, undefined);
+          } else {
+            assert.deepEqual(stableMigrationFields(records[0]), stableMigrationFields(item));
+            assert.equal(records[0].recoveryRequired, item.recoveryRequired);
+          }
           assert.deepEqual(records[0].deliveryReceipt, item.deliveryReceipt);
-          assert.equal(records[0].recoveryRequired, item.recoveryRequired);
           assert.equal(records[0].continuationNoticeAttached, item.continuationNoticeAttached);
         }
       });

@@ -114,6 +114,7 @@ interface LoadedOutboxState {
   revision: number;
   nextSequence: number;
   items: Map<string, OutboxItem>;
+  changed: boolean;
 }
 
 interface NormalizedOutboxState {
@@ -128,6 +129,10 @@ interface DecodedDeliveryState {
   deliveryReceipt?: OutboxItem['deliveryReceipt'];
   continuationNoticeAttached?: boolean;
   recoveryRequired?: boolean;
+  failureKind?: OutboxFailureKind;
+  failedAt?: number;
+  recoveryAttempts?: number;
+  changed: boolean;
 }
 
 const OUTBOX_PRIORITIES = new Set<OutboxPriority>([
@@ -474,7 +479,11 @@ export class OutboxStore {
       const loaded = this.decodeSnapshot(selected);
       const normalized = this.normalizeLoadedState(loaded);
       this.revision = loaded.revision;
-      if (normalized.changed || useBackup || selected.schemaVersion !== 2 || !Number.isInteger(selected.revision)) {
+      if (loaded.changed
+        || normalized.changed
+        || useBackup
+        || selected.schemaVersion !== 2
+        || !Number.isInteger(selected.revision)) {
         this.persistState(normalized.items, normalized.nextSequence);
       }
       this.publish(normalized.items, normalized.nextSequence);
@@ -507,6 +516,7 @@ export class OutboxStore {
     const items = new Map<string, OutboxItem>();
     const requiresStableIds = snapshot.schemaVersion === 2;
     let maxSequence = 0;
+    let changed = false;
     for (const [index, raw] of (snapshot.items ?? []).entries()) {
       if (!raw || typeof raw !== 'object') {
         throw new OutboxMigrationError(`invalid item at index ${index}: expected an object`);
@@ -531,7 +541,8 @@ export class OutboxStore {
       if (items.has(itemId)) {
         throw new OutboxMigrationError(`duplicate itemId at index ${index}: ${itemId}`);
       }
-      const deliveryState = decodeDeliveryState(value, index, requiresStableIds);
+      const deliveryState = decodeDeliveryState(value, index, requiresStableIds, this.now());
+      changed ||= deliveryState.changed;
       const candidateSequence = asPositiveSafeInteger(value.sequence);
       const sequence = candidateSequence !== undefined && candidateSequence > maxSequence
         ? candidateSequence
@@ -561,6 +572,11 @@ export class OutboxStore {
           ? { recoveryRequired: deliveryState.recoveryRequired }
           : {}),
         ...(value.terminalError ? { terminalError: value.terminalError } : {}),
+        ...(deliveryState.failureKind ? { failureKind: deliveryState.failureKind } : {}),
+        ...(deliveryState.failedAt !== undefined ? { failedAt: deliveryState.failedAt } : {}),
+        ...(deliveryState.recoveryAttempts !== undefined
+          ? { recoveryAttempts: deliveryState.recoveryAttempts }
+          : {}),
       };
       items.set(item.itemId, item);
       maxSequence = sequence;
@@ -572,6 +588,7 @@ export class OutboxStore {
         ? persistedNextSequence
         : nextSafeSequence(maxSequence),
       items,
+      changed,
     };
   }
 
@@ -708,11 +725,14 @@ function decodeDeliveryState(
   value: Partial<OutboxItem>,
   index: number,
   strictSchemaTwo: boolean,
+  now: number,
 ): DecodedDeliveryState {
   if (!strictSchemaTwo) {
+    const ambiguous = value.recoveryRequired === true;
+    const terminal = value.state === 'permanent-failure' || ambiguous;
     return {
       priority: isOutboxPriority(value.priority) ? value.priority : 'final',
-      state: value.state === 'permanent-failure' ? 'permanent-failure' : 'pending',
+      state: terminal ? 'permanent-failure' : 'pending',
       ...(isValidDeliveryReceipt(value.deliveryReceipt)
         ? { deliveryReceipt: {
             reservationId: value.deliveryReceipt.reservationId,
@@ -720,7 +740,12 @@ function decodeDeliveryState(
           } }
         : {}),
       ...(value.continuationNoticeAttached ? { continuationNoticeAttached: true } : {}),
-      ...(value.recoveryRequired ? { recoveryRequired: true } : {}),
+      ...(terminal ? {
+        failureKind: ambiguous ? 'ambiguous-delivery' : 'legacy-unknown',
+        failedAt: now,
+        recoveryAttempts: 0,
+      } : {}),
+      changed: terminal,
     };
   }
 
@@ -755,19 +780,65 @@ function decodeDeliveryState(
     );
   }
 
+  const hasFailureKind = Object.hasOwn(raw, 'failureKind');
+  if (hasFailureKind && !isOutboxFailureKind(raw.failureKind)) {
+    throw new OutboxMigrationError(`invalid schema-two item at index ${index}: unknown failureKind`);
+  }
+  const hasFailedAt = Object.hasOwn(raw, 'failedAt');
+  if (hasFailedAt && (typeof raw.failedAt !== 'number'
+    || !Number.isFinite(raw.failedAt)
+    || raw.failedAt < 0)) {
+    throw new OutboxMigrationError(`invalid schema-two item at index ${index}: failedAt must be finite and non-negative`);
+  }
+  const hasRecoveryAttempts = Object.hasOwn(raw, 'recoveryAttempts');
+  if (hasRecoveryAttempts && (!Number.isSafeInteger(raw.recoveryAttempts)
+    || (raw.recoveryAttempts as number) < 0)) {
+    throw new OutboxMigrationError(
+      `invalid schema-two item at index ${index}: recoveryAttempts must be a non-negative safe integer`,
+    );
+  }
+
+  const legacyAmbiguous = raw.recoveryRequired === true;
+  const terminal = value.state === 'permanent-failure' || legacyAmbiguous;
+  const failureKind = terminal
+    ? (legacyAmbiguous ? 'ambiguous-delivery' : (raw.failureKind as OutboxFailureKind | undefined)
+      ?? 'legacy-unknown')
+    : raw.failureKind as OutboxFailureKind | undefined;
+  const failedAt = terminal
+    ? (hasFailedAt ? raw.failedAt as number : now)
+    : (hasFailedAt ? raw.failedAt as number : undefined);
+  const recoveryAttempts = terminal
+    ? (hasRecoveryAttempts ? raw.recoveryAttempts as number : 0)
+    : (hasRecoveryAttempts ? raw.recoveryAttempts as number : undefined);
+  const changed = legacyAmbiguous
+    || (terminal && (!hasFailureKind || !hasFailedAt || !hasRecoveryAttempts));
+
   return {
     priority: value.priority,
-    state: value.state,
+    state: terminal ? 'permanent-failure' : value.state,
     ...(decodedReceipt ? { deliveryReceipt: decodedReceipt } : {}),
     ...(hasContinuationNotice
       ? { continuationNoticeAttached: raw.continuationNoticeAttached as boolean }
       : {}),
-    ...(hasRecoveryRequired ? { recoveryRequired: raw.recoveryRequired as boolean } : {}),
+    ...(hasRecoveryRequired && !legacyAmbiguous
+      ? { recoveryRequired: raw.recoveryRequired as boolean }
+      : {}),
+    ...(failureKind ? { failureKind } : {}),
+    ...(failedAt !== undefined ? { failedAt } : {}),
+    ...(recoveryAttempts !== undefined ? { recoveryAttempts } : {}),
+    changed,
   };
 }
 
 function isOutboxPriority(value: unknown): value is OutboxPriority {
   return typeof value === 'string' && OUTBOX_PRIORITIES.has(value as OutboxPriority);
+}
+
+function isOutboxFailureKind(value: unknown): value is OutboxFailureKind {
+  return value === 'expired-before-delivery'
+    || value === 'deterministic-rejection'
+    || value === 'ambiguous-delivery'
+    || value === 'legacy-unknown';
 }
 
 function isValidDeliveryReceipt(value: unknown): value is NonNullable<OutboxItem['deliveryReceipt']> {
@@ -822,7 +893,7 @@ function assertPersistableItems(items: Map<string, OutboxItem>): void {
     if (typeof item.text !== 'string') {
       throw new OutboxMigrationError(`invalid schema-two item at index ${index}: text must be a string`);
     }
-    decodeDeliveryState(item, index, true);
+    decodeDeliveryState(item, index, true, Date.now());
     index += 1;
   }
 }
