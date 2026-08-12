@@ -202,9 +202,11 @@ const TOOL_ALIASES = {
   清理保证。任意目标仓库不一定忽略 `.wx-media`；使用者应在目标仓库的 ignore 规则中
   加入 `.wx-media/`，并在提交前检查，避免把收到的媒体或副本提交进版本库。
 - 不得把用户 prompt 拼进 shell 命令；新增进程调用必须覆盖 Windows 特殊字符场景。
-- 原子写入是持久化恢复策略的一部分，不要用普通覆盖写替代。outbox 对 schema-two 记录
-  执行严格字段校验并可从备份选择快照；quota、session、config 和 context-token 等其他
-  store 对损坏或缺字段数据采用不同程度的宽松忽略、默认值或 fresh-state 回退。修改
+- 原子写入是持久化恢复策略的一部分，不要用普通覆盖写替代。outbox 对 schema-two 记录的
+  stable ID、text payload type 和 delivery state 等关键不变量执行严格拒绝，同时会归一化 sequence、
+  时间戳及部分元数据字段或为其提供默认值，并可从备份选择快照；quota、session、config
+  和 context-token 等其他 store 对损坏或缺字段数据采用不同程度的宽松忽略、默认值或
+  fresh-state 回退。修改
   持久化格式时必须按具体 store 保留并测试其真实恢复语义，不能笼统假设都有严格 schema
   拒绝或备份恢复。
 
