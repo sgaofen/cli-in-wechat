@@ -374,7 +374,7 @@ export class OutboxStore {
           state: 'permanent-failure',
           terminalError: { errmsg: 'outbox item expired before delivery' },
           failureKind: 'expired-before-delivery',
-          failedAt: this.now(),
+          failedAt: item.expiresAt,
           recoveryAttempts: item.recoveryAttempts ?? 0,
         });
         changed = true;

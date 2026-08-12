@@ -1505,6 +1505,22 @@ test('restart preserves recovery attempts and enforces the next backoff', () => 
   assert.equal(restarted.recoverExpiredFailures('account-a', 'user-a')[0]?.attempt, 2);
 });
 
+test('an item first observed long after expiry is too old to auto-recover', () => {
+  const day = 24 * 60 * 60_000;
+  let now = 1_000;
+  const store = new OutboxStore(tempPath(), {
+    now: () => now,
+    failedRetentionMs: 30 * day,
+  });
+  const item = store.enqueue(input({ itemId: 'stale-before-observation', ttlMs: 1 }));
+
+  now += 14 * day + 2;
+
+  assert.equal(store.get(item.itemId)?.failureKind, 'expired-before-delivery');
+  assert.deepEqual(store.recoverExpiredFailures('account-a', 'user-a'), []);
+  assert.equal(store.get(item.itemId)?.state, 'permanent-failure');
+});
+
 test('an unreconciled delivery receipt does not expire before acknowledgement', () => {
   let now = 1_000;
   const store = new OutboxStore(tempPath(), { defaultTtlMs: 100, now: () => now });
