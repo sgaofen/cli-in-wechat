@@ -105,7 +105,7 @@ src/
 └── utils/
     ├── crypto.ts             # 媒体加解密
     ├── http.ts               # 超时、重试和代理支持
-    ├── media.ts              # 媒体下载、校验和安全文件名
+    ├── media.ts              # 媒体下载、解密启发式和安全文件名
     ├── single-instance.ts    # 单实例锁和本地控制端点
     └── logger.ts             # 日志
 
@@ -185,17 +185,28 @@ const TOOL_ALIASES = {
 - 持久化的 `DeliveryDiagnostics` 在写入前必须通过 `redactDiagnostic()` 脱敏；这项保证
   不覆盖普通调试日志。调试日志可能包含 prompt 片段、消息正文或 URL，属于敏感数据，
   不得提交或分享。
-- `~/.wx-ai-bridge` 中的凭据、session、outbox、quota、cursor 和 diagnostics 是运行时
-  私有数据，不得提交、复制进 fixture 或在错误信息中完整输出。
+- `~/.wx-ai-bridge` 中的凭据、`context_tokens.json`、session、outbox、quota、cursor 和
+  diagnostics 是运行时私有数据，不得提交、复制进 fixture 或在错误信息中完整输出。
 - 单实例所有权由操作系统 pipe/socket 端点仲裁，而不是仅凭 PID 或 lock 文件判断；第二个
   owner 必须被拒绝，过期 lock 即使记录了仍存活的无关 PID，也不能阻止新实例取得所有权。
 - `wcli send` 必须委托给已运行的 bridge；若启动竞争中获取所有权失败，必须重试向现有
   bridge 发起请求。
 - `release()` 只有在 lock 中的 `instanceId` 仍属于当前实例时才能删除该 lock。
-- 收到的文件名必须经过安全化，禁止路径穿越、隐藏文件和控制字符；媒体格式以 magic
-  bytes 校验，不只信任扩展名。
+- 收到的文件名必须经过安全化，禁止路径穿越、隐藏文件和控制字符。图片的直接 URL
+  下载路径会按安全文件名保存响应字节，不做 magic-byte 校验；CDN/AES 路径只用已知
+  magic bytes 启发式判断响应是否已经是明文，以及 AES-ECB 解密结果是否可识别。这不是
+  对所有媒体格式的严格验证：未知格式、缺少密钥或解密失败时，当前实现仍会保存原始
+  字节，并可能得到无法查看的文件。
+- 入站媒体最初保存在 `~/.wx-ai-bridge/media`；适配器为目标工作目录构造 prompt 时，还
+  可能复制到 `<workDir>/.wx-media`。`cleanupMedia()` 当前没有调用方，两个位置都没有自动
+  清理保证。任意目标仓库不一定忽略 `.wx-media`；使用者应在目标仓库的 ignore 规则中
+  加入 `.wx-media/`，并在提交前检查，避免把收到的媒体或副本提交进版本库。
 - 不得把用户 prompt 拼进 shell 命令；新增进程调用必须覆盖 Windows 特殊字符场景。
-- 原子写入和 schema 校验是恢复保证的一部分，不要用普通覆盖写替代。
+- 原子写入是持久化恢复策略的一部分，不要用普通覆盖写替代。outbox 对 schema-two 记录
+  执行严格字段校验并可从备份选择快照；quota、session、config 和 context-token 等其他
+  store 对损坏或缺字段数据采用不同程度的宽松忽略、默认值或 fresh-state 回退。修改
+  持久化格式时必须按具体 store 保留并测试其真实恢复语义，不能笼统假设都有严格 schema
+  拒绝或备份恢复。
 
 修改上述行为时至少运行：
 

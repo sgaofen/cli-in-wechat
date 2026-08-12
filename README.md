@@ -32,7 +32,7 @@ claude -p / codex exec / gemini -p / kimi -p / opencode run
 
 ### 前置要求
 
-- **Node.js** >= 18
+- **Node.js** >= 20
 - **微信** 已启用 ClawBot 插件（我 → 设置 → 插件）
 - 至少一个 CLI 工具：
 
