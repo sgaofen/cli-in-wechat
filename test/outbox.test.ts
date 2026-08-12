@@ -190,6 +190,19 @@ test('terminal failures do not consume active item or byte capacity', () => {
   assert.deepEqual(store.listPending('user-a').map((item) => item.itemId), ['final-2']);
 });
 
+test('active capacity ignores terminal audit records that carry a legacy receipt', () => {
+  const store = new OutboxStore(tempPath(), { maxItemsPerUser: 1, maxBytesPerUser: 12 });
+  const failed = store.enqueue(input({ itemId: 'failed-with-receipt', text: 'old failure' }));
+  store.recordDeliveryReceipt(failed.itemId, 'legacy-reservation', 1);
+  store.markPermanentFailure(failed.itemId, { httpStatus: 400 }, 'deterministic-rejection');
+
+  assert.doesNotThrow(
+    () => store.enqueue(input({ itemId: 'new-pending', text: 'new pending' })),
+  );
+  assert.equal(store.get(failed.itemId)?.deliveryReceipt?.reservationId, 'legacy-reservation');
+  assert.deepEqual(store.listPending('user-a').map((item) => item.itemId), ['new-pending']);
+});
+
 test('terminal retention expires old failures without deleting pending or receipts', () => {
   let now = 1_000;
   const store = new OutboxStore(tempPath(), {

@@ -227,7 +227,7 @@ export class OutboxStore {
       const userItems = [...nextItems.values()].filter((item) =>
         item.accountId === input.accountId
         && item.userId === input.userId
-        && (item.state === 'pending' || Boolean(item.deliveryReceipt)));
+        && item.state === 'pending');
       this.ensureCapacity(userItems, bytes);
       const createdAt = input.createdAt ?? this.now();
       const sequence = asPositiveSafeInteger(nextSequence);
