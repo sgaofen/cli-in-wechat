@@ -1349,30 +1349,142 @@ test('capacity pressure never evicts queued activity for a final result', () => 
   ]);
 });
 
-test('requeues selected permanent failures without changing identity or payload', () => {
-  const store = new OutboxStore(tempPath());
-  const item = store.enqueue(input({ itemId: 'failed-1' }));
-  store.markPermanentFailure(item.itemId, { errmsg: 'retryable local failure' });
+test('recovers only recent expired failures whose attempt backoff elapsed', () => {
+  const minute = 60_000;
+  const day = 24 * 60 * minute;
+  const now = 20 * day;
+  const filePath = tempPath();
+  const specs = [
+    ['eligible-first', 'expired-before-delivery', now, 0],
+    ['eligible-second', 'expired-before-delivery', now - 5 * minute, 1],
+    ['eligible-third', 'expired-before-delivery', now - 30 * minute, 2],
+    ['backoff-first', 'expired-before-delivery', now - 5 * minute + 1, 1],
+    ['backoff-second', 'expired-before-delivery', now - 30 * minute + 1, 2],
+    ['attempts-exhausted', 'expired-before-delivery', now - day, 3],
+    ['too-old', 'expired-before-delivery', now - 14 * day - 1, 0],
+    ['deterministic', 'deterministic-rejection', now - day, 0],
+    ['ambiguous', 'ambiguous-delivery', now - day, 0],
+    ['legacy', 'legacy-unknown', now - day, 0],
+  ] as const;
+  const items = specs.map(([itemId, failureKind, failedAt, recoveryAttempts], index) => ({
+    schemaVersion: 2,
+    itemId,
+    clientId: `${itemId}-client`,
+    sequence: index + 1,
+    kind: 'text',
+    accountId: 'account-a',
+    userId: 'user-a',
+    generation: 1,
+    tokenVersion: 1,
+    priority: 'final',
+    text: `${itemId}-body`,
+    bytes: Buffer.byteLength(`${itemId}-body`, 'utf8'),
+    createdAt: 1,
+    expiresAt: 2,
+    state: 'permanent-failure',
+    terminalError: { errmsg: `${itemId}-error` },
+    failureKind,
+    failedAt,
+    recoveryAttempts,
+  }));
+  items.push({
+    ...items[0],
+    itemId: 'receipt-failure',
+    clientId: 'receipt-failure-client',
+    sequence: items.length + 1,
+    deliveryReceipt: { reservationId: 'reservation-1', quotaGeneration: 1 },
+  } as typeof items[number]);
+  writeFileSync(filePath, JSON.stringify({
+    schemaVersion: 2,
+    revision: 1,
+    nextSequence: items.length + 1,
+    items,
+  }));
+  const store = new OutboxStore(filePath, { now: () => now, failedRetentionMs: 30 * day });
 
-  assert.equal(store.requeuePermanentFailures((candidate) => candidate.itemId === item.itemId), 1);
-  const requeued = store.get(item.itemId);
-  assert.equal(requeued?.state, 'pending');
-  assert.equal(requeued?.clientId, item.clientId);
-  assert.equal(requeued?.text, item.text);
+  const recovered = store.recoverExpiredFailures('account-a', 'user-a');
+
+  assert.deepEqual(recovered, [
+    { itemId: 'eligible-first', kind: 'expired-before-delivery', ageMs: 0, attempt: 1 },
+    { itemId: 'eligible-second', kind: 'expired-before-delivery', ageMs: 5 * minute, attempt: 2 },
+    { itemId: 'eligible-third', kind: 'expired-before-delivery', ageMs: 30 * minute, attempt: 3 },
+  ]);
+  assert.deepEqual(store.listPending('user-a').map((item) => item.itemId), [
+    'eligible-first',
+    'eligible-second',
+    'eligible-third',
+  ]);
+  assert.deepEqual(store.list().filter((item) => item.state === 'permanent-failure')
+    .map((item) => item.itemId), [
+    'backoff-first',
+    'backoff-second',
+    'attempts-exhausted',
+    'too-old',
+    'deterministic',
+    'ambiguous',
+    'legacy',
+    'receipt-failure',
+  ]);
 });
 
-test('requeueing an expired failure renews its delivery lifetime', () => {
+test('recovered failures append to the active FIFO tail in stable relative order', () => {
   let now = 1_000;
-  const store = new OutboxStore(tempPath(), { defaultTtlMs: 100, now: () => now });
-  const item = store.enqueue(input({ itemId: 'expired-1' }));
-  now = 1_100;
-  assert.equal(store.get(item.itemId)?.state, 'permanent-failure');
+  const filePath = tempPath();
+  const store = new OutboxStore(filePath, { now: () => now, defaultTtlMs: 100 });
+  const activeFirst = store.enqueue(input({ itemId: 'active-first', text: 'active one', ttlMs: 10_000 }));
+  const expiredFirst = store.enqueue(input({ itemId: 'expired-first', text: 'expired one', ttlMs: 1 }));
+  const expiredSecond = store.enqueue(input({ itemId: 'expired-second', text: 'expired two', ttlMs: 1 }));
+  const activeLast = store.enqueue(input({ itemId: 'active-last', text: 'active two', ttlMs: 10_000 }));
+  now += 1;
+  assert.equal(store.get(expiredFirst.itemId)?.state, 'permanent-failure');
+  assert.equal(store.get(expiredSecond.itemId)?.state, 'permanent-failure');
 
-  assert.equal(store.requeuePermanentFailures((candidate) => candidate.itemId === item.itemId), 1);
+  const recovered = store.recoverExpiredFailures('account-a', 'user-a');
 
-  const requeued = store.get(item.itemId);
-  assert.equal(requeued?.state, 'pending');
-  assert.equal(requeued?.expiresAt, 1_200);
+  assert.deepEqual(recovered.map((item) => item.itemId), ['expired-first', 'expired-second']);
+  assert.deepEqual(store.listPending('user-a').map((item) => item.itemId), [
+    activeFirst.itemId,
+    activeLast.itemId,
+    expiredFirst.itemId,
+    expiredSecond.itemId,
+  ]);
+  for (const original of [expiredFirst, expiredSecond]) {
+    const item = store.get(original.itemId);
+    assert.equal(item?.clientId, original.clientId);
+    assert.equal(item?.text, original.text);
+    assert.equal(item?.recoveryAttempts, 1);
+    assert.equal(item?.expiresAt, now + 100);
+  }
+
+  const reloaded = new OutboxStore(filePath, { now: () => now, defaultTtlMs: 100 });
+  assert.deepEqual(reloaded.listPending('user-a').map((item) => item.itemId), [
+    activeFirst.itemId,
+    activeLast.itemId,
+    expiredFirst.itemId,
+    expiredSecond.itemId,
+  ]);
+  assert.deepEqual(
+    reloaded.listPending('user-a').slice(-2).map((item) => item.recoveryAttempts),
+    [1, 1],
+  );
+});
+
+test('restart preserves recovery attempts and enforces the next backoff', () => {
+  let now = 1_000;
+  const filePath = tempPath();
+  const first = new OutboxStore(filePath, { now: () => now, defaultTtlMs: 100 });
+  first.enqueue(input({ itemId: 'retry-after-restart', ttlMs: 1 }));
+  now += 1;
+  assert.equal(first.recoverExpiredFailures('account-a', 'user-a')[0]?.attempt, 1);
+
+  now += 100;
+  const restarted = new OutboxStore(filePath, { now: () => now, defaultTtlMs: 100 });
+  assert.equal(restarted.get('retry-after-restart')?.state, 'permanent-failure');
+  assert.equal(restarted.get('retry-after-restart')?.recoveryAttempts, 1);
+  assert.deepEqual(restarted.recoverExpiredFailures('account-a', 'user-a'), []);
+
+  now += 5 * 60_000;
+  assert.equal(restarted.recoverExpiredFailures('account-a', 'user-a')[0]?.attempt, 2);
 });
 
 test('an unreconciled delivery receipt does not expire before acknowledgement', () => {

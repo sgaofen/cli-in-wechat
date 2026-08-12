@@ -75,6 +75,13 @@ export interface OutboxOptions {
   now?: () => number;
 }
 
+export interface OutboxRecovery {
+  itemId: string;
+  kind: 'expired-before-delivery';
+  ageMs: number;
+  attempt: number;
+}
+
 export class OutboxCapacityError extends Error {
   constructor(message = 'outbox capacity exceeded; durable final content was preserved') {
     super(message);
@@ -147,6 +154,9 @@ const DEFAULT_TTL_MS = 7 * 24 * 60 * 60_000;
 const DEFAULT_FAILED_RETENTION_MS = 14 * 24 * 60 * 60_000;
 const DEFAULT_MAX_FAILED_ITEMS_PER_USER = 100;
 const DEFAULT_MAX_FAILED_BYTES_PER_USER = 200_000;
+const MAX_RECOVERY_AGE_MS = 14 * 24 * 60 * 60_000;
+const MAX_RECOVERY_ATTEMPTS = 3;
+const RECOVERY_BACKOFF_MS = [0, 5 * 60_000, 30 * 60_000] as const;
 
 export class OutboxStore {
   private readonly items = new Map<string, OutboxItem>();
@@ -374,28 +384,6 @@ export class OutboxStore {
     return changed;
   }
 
-  requeuePermanentFailures(matches: (item: OutboxItem) => boolean): number {
-    const nextItems = new Map(this.items);
-    let changed = 0;
-    for (const [itemId, item] of nextItems) {
-      if (item.state !== 'permanent-failure' || !matches(item)) continue;
-      const requeued = {
-        ...item,
-        state: 'pending',
-        expiresAt: item.expiresAt <= this.now() ? this.now() + this.defaultTtlMs : item.expiresAt,
-      } satisfies OutboxItem;
-      delete requeued.recoveryRequired;
-      delete requeued.terminalError;
-      nextItems.set(itemId, requeued);
-      changed += 1;
-    }
-    if (changed > 0) {
-      this.persistState(nextItems, this.nextSequence);
-      this.publish(nextItems, this.nextSequence);
-    }
-    return changed;
-  }
-
   private ensureCapacity(userItems: OutboxItem[], incomingBytes: number): void {
     const count = userItems.length + 1;
     const bytes = userItems.reduce((sum, item) => sum + item.bytes, 0) + incomingBytes;
@@ -429,6 +417,68 @@ export class OutboxStore {
       }
     }
     return changed;
+  }
+
+  recoverExpiredFailures(accountId: string, userId: string): OutboxRecovery[] {
+    const nextItems = new Map(this.items);
+    const expired = this.markExpired(nextItems);
+    const pruned = this.pruneFailed(nextItems);
+    const now = this.now();
+    const eligible = [...nextItems.values()]
+      .filter((item) => item.accountId === accountId
+        && item.userId === userId
+        && item.state === 'permanent-failure'
+        && !item.deliveryReceipt
+        && item.failureKind === 'expired-before-delivery'
+        && (item.recoveryAttempts ?? 0) < MAX_RECOVERY_ATTEMPTS
+        && item.failedAt !== undefined
+        && now - item.failedAt >= 0
+        && now - item.failedAt <= MAX_RECOVERY_AGE_MS
+        && now - item.failedAt >= RECOVERY_BACKOFF_MS[item.recoveryAttempts ?? 0])
+      .sort((left, right) => left.sequence - right.sequence
+        || left.itemId.localeCompare(right.itemId));
+
+    let activeCount = 0;
+    let activeBytes = 0;
+    for (const item of nextItems.values()) {
+      if (item.accountId !== accountId || item.userId !== userId || item.state !== 'pending') continue;
+      activeCount += 1;
+      activeBytes += item.bytes;
+    }
+
+    let nextSequence = this.nextSequence;
+    const recovered: OutboxRecovery[] = [];
+    for (const item of eligible) {
+      if (activeCount + 1 > this.maxItemsPerUser
+        || activeBytes + item.bytes > this.maxBytesPerUser) break;
+      const sequence = asPositiveSafeInteger(nextSequence);
+      if (sequence === undefined) throw sequenceCapacityError();
+      nextSequence = nextSafeSequence(sequence);
+      const attempt = (item.recoveryAttempts ?? 0) + 1;
+      const ageMs = now - item.failedAt!;
+      const requeued: OutboxItem = {
+        ...item,
+        sequence,
+        state: 'pending',
+        expiresAt: now + this.defaultTtlMs,
+        recoveryAttempts: attempt,
+      };
+      delete requeued.recoveryRequired;
+      delete requeued.terminalError;
+      delete requeued.failureKind;
+      delete requeued.failedAt;
+      nextItems.delete(item.itemId);
+      nextItems.set(item.itemId, requeued);
+      activeCount += 1;
+      activeBytes += item.bytes;
+      recovered.push({ itemId: item.itemId, kind: 'expired-before-delivery', ageMs, attempt });
+    }
+
+    if (expired || pruned || recovered.length > 0) {
+      this.persistState(nextItems, nextSequence);
+      this.publish(nextItems, nextSequence);
+    }
+    return recovered;
   }
 
   private pruneFailed(target: Map<string, OutboxItem>): boolean {
