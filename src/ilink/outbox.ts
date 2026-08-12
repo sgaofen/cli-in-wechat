@@ -7,6 +7,11 @@ import { chunkUtf8Text } from './text-chunk.js';
 
 export type OutboxPriority = 'final' | 'control' | 'media' | 'intermediate' | 'activity';
 export type OutboxState = 'pending' | 'permanent-failure';
+export type OutboxFailureKind =
+  | 'expired-before-delivery'
+  | 'deterministic-rejection'
+  | 'ambiguous-delivery'
+  | 'legacy-unknown';
 
 export interface OutboxError {
   ret?: number;
@@ -38,6 +43,9 @@ export interface OutboxItem {
   continuationNoticeAttached?: boolean;
   recoveryRequired?: boolean;
   terminalError?: OutboxError;
+  failureKind?: OutboxFailureKind;
+  failedAt?: number;
+  recoveryAttempts?: number;
 }
 
 export interface OutboxInput {
@@ -57,6 +65,9 @@ export interface OutboxOptions {
   defaultTtlMs?: number;
   maxItemsPerUser?: number;
   maxBytesPerUser?: number;
+  maxFailedItemsPerUser?: number;
+  maxFailedBytesPerUser?: number;
+  failedRetentionMs?: number;
   finalReserveItems?: number;
   finalReserveBytes?: number;
   bodyChunkBytes?: number;
@@ -128,6 +139,9 @@ const OUTBOX_PRIORITIES = new Set<OutboxPriority>([
 ]);
 
 const DEFAULT_TTL_MS = 7 * 24 * 60 * 60_000;
+const DEFAULT_FAILED_RETENTION_MS = 14 * 24 * 60 * 60_000;
+const DEFAULT_MAX_FAILED_ITEMS_PER_USER = 100;
+const DEFAULT_MAX_FAILED_BYTES_PER_USER = 200_000;
 
 export class OutboxStore {
   private readonly items = new Map<string, OutboxItem>();
@@ -135,6 +149,9 @@ export class OutboxStore {
   private readonly defaultTtlMs: number;
   private readonly maxItemsPerUser: number;
   private readonly maxBytesPerUser: number;
+  private readonly maxFailedItemsPerUser: number;
+  private readonly maxFailedBytesPerUser: number;
+  private readonly failedRetentionMs: number;
   private readonly bodyChunkBytes?: number;
   private readonly inboundItemLimit?: number;
   private readonly now: () => number;
@@ -146,6 +163,9 @@ export class OutboxStore {
     this.defaultTtlMs = options.defaultTtlMs ?? DEFAULT_TTL_MS;
     this.maxItemsPerUser = options.maxItemsPerUser ?? 500;
     this.maxBytesPerUser = options.maxBytesPerUser ?? 1_000_000;
+    this.maxFailedItemsPerUser = options.maxFailedItemsPerUser ?? DEFAULT_MAX_FAILED_ITEMS_PER_USER;
+    this.maxFailedBytesPerUser = options.maxFailedBytesPerUser ?? DEFAULT_MAX_FAILED_BYTES_PER_USER;
+    this.failedRetentionMs = options.failedRetentionMs ?? DEFAULT_FAILED_RETENTION_MS;
     if (options.bodyChunkBytes === undefined && options.inboundItemLimit === undefined) {
       this.bodyChunkBytes = undefined;
       this.inboundItemLimit = undefined;
@@ -190,7 +210,9 @@ export class OutboxStore {
       }
       const bytes = Buffer.byteLength(input.text, 'utf8');
       const userItems = [...nextItems.values()].filter((item) =>
-        item.accountId === input.accountId && item.userId === input.userId);
+        item.accountId === input.accountId
+        && item.userId === input.userId
+        && (item.state === 'pending' || Boolean(item.deliveryReceipt)));
       this.ensureCapacity(userItems, bytes);
       const createdAt = input.createdAt ?? this.now();
       const sequence = asPositiveSafeInteger(nextSequence);
@@ -294,7 +316,11 @@ export class OutboxStore {
     return frozen;
   }
 
-  markPermanentFailure(itemId: string, error: OutboxError): boolean {
+  markPermanentFailure(
+    itemId: string,
+    error: OutboxError,
+    failureKind: OutboxFailureKind = 'legacy-unknown',
+  ): boolean {
     const item = this.items.get(itemId);
     if (!item || item.state === 'permanent-failure') return false;
     const nextItems = new Map(this.items);
@@ -303,7 +329,11 @@ export class OutboxStore {
       state: 'permanent-failure',
       recoveryRequired: false,
       terminalError: error,
+      failureKind,
+      failedAt: this.now(),
+      recoveryAttempts: item.recoveryAttempts ?? 0,
     });
+    this.pruneFailed(nextItems);
     this.persistState(nextItems, this.nextSequence);
     this.publish(nextItems, this.nextSequence);
     return true;
@@ -371,7 +401,9 @@ export class OutboxStore {
 
   private pruneExpired(): void {
     const nextItems = new Map(this.items);
-    if (!this.markExpired(nextItems)) return;
+    const expired = this.markExpired(nextItems);
+    const pruned = this.pruneFailed(nextItems);
+    if (!expired && !pruned) return;
     this.persistState(nextItems, this.nextSequence);
     this.publish(nextItems, this.nextSequence);
   }
@@ -384,7 +416,48 @@ export class OutboxStore {
           ...item,
           state: 'permanent-failure',
           terminalError: { errmsg: 'outbox item expired before delivery' },
+          failureKind: 'expired-before-delivery',
+          failedAt: this.now(),
+          recoveryAttempts: item.recoveryAttempts ?? 0,
         });
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  private pruneFailed(target: Map<string, OutboxItem>): boolean {
+    const failedByUser = new Map<string, OutboxItem[]>();
+    for (const item of target.values()) {
+      if (item.state !== 'permanent-failure' || item.deliveryReceipt) continue;
+      const key = `${item.accountId}\u0000${item.userId}`;
+      const failures = failedByUser.get(key) ?? [];
+      failures.push(item);
+      failedByUser.set(key, failures);
+    }
+
+    let changed = false;
+    for (const failures of failedByUser.values()) {
+      failures.sort((left, right) => (left.failedAt ?? left.createdAt) - (right.failedAt ?? right.createdAt)
+        || left.sequence - right.sequence
+        || left.itemId.localeCompare(right.itemId));
+      const retained: OutboxItem[] = [];
+      for (const item of failures) {
+        const failedAt = item.failedAt ?? item.createdAt;
+        if (this.now() - failedAt > this.failedRetentionMs) {
+          target.delete(item.itemId);
+          changed = true;
+        } else {
+          retained.push(item);
+        }
+      }
+
+      let retainedBytes = retained.reduce((sum, item) => sum + item.bytes, 0);
+      while (retained.length > this.maxFailedItemsPerUser
+        || retainedBytes > this.maxFailedBytesPerUser) {
+        const oldest = retained.shift()!;
+        retainedBytes -= oldest.bytes;
+        target.delete(oldest.itemId);
         changed = true;
       }
     }

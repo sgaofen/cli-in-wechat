@@ -162,17 +162,85 @@ test('does not silently evict final items when capacity is exhausted', () => {
   assert.deepEqual(store.listPending('user-a').map((item) => item.itemId), ['final-1']);
 });
 
-test('capacity pressure never deletes a permanent-failure final record', () => {
-  const store = new OutboxStore(tempPath(), { maxItemsPerUser: 1, maxBytesPerUser: 100 });
-  const failed = store.enqueue(input({ itemId: 'failed-final' }));
-  store.markPermanentFailure(failed.itemId, { errmsg: 'manual recovery required' });
+test('terminal failures do not consume active item or byte capacity', () => {
+  const store = new OutboxStore(tempPath(), {
+    maxItemsPerUser: 1,
+    maxBytesPerUser: 12,
+    maxFailedItemsPerUser: 10,
+    maxFailedBytesPerUser: 1_000,
+  });
+  const failed = store.enqueue(input({ itemId: 'failed-final', text: 'old failure' }));
+  store.markPermanentFailure(
+    failed.itemId,
+    { httpStatus: 400 },
+    'deterministic-rejection',
+  );
 
-  assert.throws(
-    () => store.enqueue(input({ itemId: 'final-2', text: 'another final' })),
-    OutboxCapacityError,
+  assert.doesNotThrow(
+    () => store.enqueue(input({ itemId: 'final-2', text: 'new pending' })),
   );
   assert.equal(store.get(failed.itemId)?.state, 'permanent-failure');
+  assert.equal(store.get(failed.itemId)?.failureKind, 'deterministic-rejection');
   assert.equal(store.get(failed.itemId)?.clientId, failed.clientId);
+  assert.deepEqual(store.listPending('user-a').map((item) => item.itemId), ['final-2']);
+});
+
+test('terminal retention expires old failures without deleting pending or receipts', () => {
+  let now = 1_000;
+  const store = new OutboxStore(tempPath(), {
+    now: () => now,
+    failedRetentionMs: 100,
+    maxFailedItemsPerUser: 10,
+    maxFailedBytesPerUser: 1_000,
+  });
+  const failed = store.enqueue(input({ itemId: 'expired-failure', createdAt: now }));
+  store.markPermanentFailure(failed.itemId, { httpStatus: 400 }, 'deterministic-rejection');
+  const pending = store.enqueue(input({ itemId: 'pending', createdAt: now, ttlMs: 10_000 }));
+  const receipt = store.enqueue(input({ itemId: 'receipt', createdAt: now, ttlMs: 1 }));
+  store.recordDeliveryReceipt(receipt.itemId, 'reservation-1', 1);
+
+  now += 101;
+
+  assert.equal(store.get(failed.itemId), undefined);
+  assert.equal(store.get(pending.itemId)?.state, 'pending');
+  assert.equal(store.get(receipt.itemId)?.deliveryReceipt?.reservationId, 'reservation-1');
+});
+
+test('terminal retention trims oldest failures to both item and byte budgets', () => {
+  let now = 1_000;
+  const store = new OutboxStore(tempPath(), {
+    now: () => now,
+    maxFailedItemsPerUser: 2,
+    maxFailedBytesPerUser: 6,
+    failedRetentionMs: 10_000,
+  });
+  for (const [itemId, text] of [
+    ['oldest', '1111'],
+    ['middle', '22'],
+    ['newest', '3333'],
+  ] as const) {
+    const item = store.enqueue(input({ itemId, text, createdAt: now }));
+    store.markPermanentFailure(item.itemId, { httpStatus: 400 }, 'deterministic-rejection');
+    now += 1;
+  }
+
+  assert.deepEqual(store.list().map((item) => item.itemId), ['middle', 'newest']);
+  assert.equal(store.list().reduce((sum, item) => sum + item.bytes, 0), 6);
+});
+
+test('items expiring together are immediately constrained by terminal retention', () => {
+  const filePath = tempPath();
+  let now = 1_000;
+  const store = new OutboxStore(filePath, {
+    now: () => now,
+    maxFailedItemsPerUser: 1,
+  });
+  store.enqueue(input({ itemId: 'expires-first', createdAt: now, ttlMs: 10 }));
+  store.enqueue(input({ itemId: 'expires-second', createdAt: now + 1, ttlMs: 9 }));
+
+  now += 10;
+
+  assert.deepEqual(store.list().map((item) => item.itemId), ['expires-second']);
 });
 
 test('capacity pressure never evicts an unreconciled delivery receipt', () => {
