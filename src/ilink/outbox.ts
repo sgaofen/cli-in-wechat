@@ -305,13 +305,7 @@ export class OutboxStore {
   }
 
   markAmbiguous(itemId: string, error: OutboxError): boolean {
-    const item = this.items.get(itemId);
-    if (!item || item.state !== 'pending') return false;
-    const nextItems = new Map(this.items);
-    nextItems.set(itemId, { ...item, recoveryRequired: true, terminalError: error });
-    this.persistState(nextItems, this.nextSequence);
-    this.publish(nextItems, this.nextSequence);
-    return true;
+    return this.markPermanentFailure(itemId, error, 'ambiguous-delivery');
   }
 
   freezeText(itemId: string, text: string, continuationNoticeAttached = false): OutboxItem | undefined {
@@ -352,36 +346,6 @@ export class OutboxStore {
     this.persistState(nextItems, this.nextSequence);
     this.publish(nextItems, this.nextSequence);
     return true;
-  }
-
-  clearRecoveryRequired(itemId: string): boolean {
-    const item = this.items.get(itemId);
-    if (!item?.recoveryRequired) return false;
-    const nextItems = new Map(this.items);
-    const cleared = { ...item };
-    delete cleared.recoveryRequired;
-    nextItems.set(itemId, cleared);
-    this.persistState(nextItems, this.nextSequence);
-    this.publish(nextItems, this.nextSequence);
-    return true;
-  }
-
-  clearRecoveryRequiredForUser(accountId: string, userId: string): number {
-    const nextItems = new Map(this.items);
-    let changed = 0;
-    for (const [itemId, item] of nextItems) {
-      if (item.accountId !== accountId || item.userId !== userId || !item.recoveryRequired) continue;
-      const cleared = { ...item };
-      delete cleared.recoveryRequired;
-      delete cleared.terminalError;
-      nextItems.set(itemId, cleared);
-      changed += 1;
-    }
-    if (changed > 0) {
-      this.persistState(nextItems, this.nextSequence);
-      this.publish(nextItems, this.nextSequence);
-    }
-    return changed;
   }
 
   private ensureCapacity(userItems: OutboxItem[], incomingBytes: number): void {

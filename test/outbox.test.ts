@@ -114,17 +114,22 @@ test('persists a confirmed delivery receipt until quota reconciliation', () => {
   });
 });
 
-test('ambiguous records remain pending with their original payload', () => {
-  const store = new OutboxStore(tempPath());
+test('ambiguous records become terminal without losing identity or payload', () => {
+  const now = 1_000;
+  const store = new OutboxStore(tempPath(), { now: () => now });
   const created = store.enqueue(input({ itemId: 'ambiguous-1' }));
 
   assert.equal(store.markAmbiguous('ambiguous-1', { errmsg: 'timeout' }), true);
-  const pending = store.listPending('user-a')[0];
-  assert.equal(pending.clientId, created.clientId);
-  assert.equal(pending.text, created.text);
-  assert.equal(pending.state, 'pending');
-  assert.equal(pending.recoveryRequired, true);
-  assert.deepEqual(pending.terminalError, { errmsg: 'timeout' });
+  const failed = store.get('ambiguous-1');
+  assert.equal(store.listPending('user-a').length, 0);
+  assert.equal(failed?.clientId, created.clientId);
+  assert.equal(failed?.text, created.text);
+  assert.equal(failed?.state, 'permanent-failure');
+  assert.equal(failed?.failureKind, 'ambiguous-delivery');
+  assert.equal(failed?.failedAt, now);
+  assert.equal(failed?.recoveryAttempts, 0);
+  assert.equal(failed?.recoveryRequired, false);
+  assert.deepEqual(failed?.terminalError, { errmsg: 'timeout' });
 });
 
 test('final enqueue preserves same-generation activity and intermediate records in fifo order', () => {

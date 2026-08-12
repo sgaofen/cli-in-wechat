@@ -416,7 +416,17 @@ export class ILinkClient {
     // Cache context_token for this user
     if (msg.context_token) this.contextTokens.set(msg.from_user_id, msg.context_token);
     this.persistContextTokens();
-    this.outbox.clearRecoveryRequiredForUser(this.accountId, msg.from_user_id);
+    const recovered = this.outbox.recoverExpiredFailures(this.accountId, msg.from_user_id);
+    for (const item of recovered) {
+      this.diagnostics.record({
+        event: 'outbox-recovery',
+        userId: msg.from_user_id,
+        count: recovered.length,
+        failureKind: item.kind,
+        ageMs: item.ageMs,
+        attempt: item.attempt,
+      });
+    }
 
     log.debug(`[msg] item_list=${JSON.stringify(redactSecrets(msg.item_list))}`);
     const { text, refText, mediaItems } = await parseMessage(msg);
@@ -716,13 +726,14 @@ export class ILinkClient {
           );
           results.push(this.resultForItem(frozen, 'rate-limited', details));
         } else if (classified?.status === 'permanent-failure') {
-          this.outbox.markPermanentFailure(frozen.itemId, details);
+          this.outbox.markPermanentFailure(frozen.itemId, details, 'deterministic-rejection');
           results.push(this.resultForItem(frozen, 'permanent-failure', details));
         } else {
           this.outbox.markAmbiguous(frozen.itemId, details);
           results.push(this.resultForItem(frozen, 'ambiguous', details));
         }
-        break;
+        if (classified?.status === 'rate-limited') break;
+        continue;
       }
 
       try {
