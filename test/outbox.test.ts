@@ -190,8 +190,12 @@ test('terminal failures do not consume active item or byte capacity', () => {
   assert.deepEqual(store.listPending('user-a').map((item) => item.itemId), ['final-2']);
 });
 
-test('active capacity ignores terminal audit records that carry a legacy receipt', () => {
-  const store = new OutboxStore(tempPath(), { maxItemsPerUser: 1, maxBytesPerUser: 12 });
+test('terminal retention removes failed records with receipts without touching active capacity', () => {
+  const store = new OutboxStore(tempPath(), {
+    maxItemsPerUser: 1,
+    maxBytesPerUser: 12,
+    maxFailedItemsPerUser: 0,
+  });
   const failed = store.enqueue(input({ itemId: 'failed-with-receipt', text: 'old failure' }));
   store.recordDeliveryReceipt(failed.itemId, 'legacy-reservation', 1);
   store.markPermanentFailure(failed.itemId, { httpStatus: 400 }, 'deterministic-rejection');
@@ -199,7 +203,7 @@ test('active capacity ignores terminal audit records that carry a legacy receipt
   assert.doesNotThrow(
     () => store.enqueue(input({ itemId: 'new-pending', text: 'new pending' })),
   );
-  assert.equal(store.get(failed.itemId)?.deliveryReceipt?.reservationId, 'legacy-reservation');
+  assert.equal(store.get(failed.itemId), undefined);
   assert.deepEqual(store.listPending('user-a').map((item) => item.itemId), ['new-pending']);
 });
 
@@ -259,6 +263,26 @@ test('items expiring together are immediately constrained by terminal retention'
   now += 10;
 
   assert.deepEqual(store.list().map((item) => item.itemId), ['expires-second']);
+});
+
+test('enqueue persists expired failures only after applying terminal retention', () => {
+  const filePath = tempPath();
+  let now = 1_000;
+  const store = new OutboxStore(filePath, {
+    now: () => now,
+    maxFailedItemsPerUser: 1,
+  });
+  store.enqueue(input({ itemId: 'write-expired-first', createdAt: now, ttlMs: 1 }));
+  store.enqueue(input({ itemId: 'write-expired-second', createdAt: now, ttlMs: 1 }));
+
+  now += 1;
+  store.enqueue(input({ itemId: 'write-active', createdAt: now, ttlMs: 10_000 }));
+
+  const persisted = JSON.parse(readFileSync(filePath, 'utf8')) as { items: OutboxItem[] };
+  assert.deepEqual(persisted.items.map((item) => item.itemId), [
+    'write-expired-second',
+    'write-active',
+  ]);
 });
 
 test('capacity pressure never evicts an unreconciled delivery receipt', () => {
@@ -1340,6 +1364,85 @@ test('prefers a newer valid backup after a crash before the primary write', () =
   assert.equal(JSON.parse(readFileSync(filePath, 'utf8')).items[0]?.itemId, 'newer-backup');
 });
 
+test('falls back from a newer semantically invalid primary to a valid backup', () => {
+  const filePath = tempPath();
+  const backupPath = `${filePath}.bak`;
+  const validItem = {
+    ...input({ itemId: 'valid-backup-item' }),
+    schemaVersion: 2,
+    clientId: 'valid-backup-client',
+    sequence: 1,
+    kind: 'text',
+    bytes: Buffer.byteLength('frozen body', 'utf8'),
+    createdAt: Date.now(),
+    expiresAt: Date.now() + 60_000,
+    state: 'pending',
+  };
+  writeFileSync(backupPath, JSON.stringify({
+    schemaVersion: 2,
+    revision: 2,
+    nextSequence: 2,
+    items: [validItem],
+  }));
+  writeFileSync(filePath, JSON.stringify({
+    schemaVersion: 2,
+    revision: 99,
+    nextSequence: 2,
+    items: [{ ...validItem, state: 'not-a-state' }],
+  }));
+
+  const recovered = new OutboxStore(filePath);
+
+  assert.equal(recovered.listPending('user-a')[0]?.itemId, 'valid-backup-item');
+  const repairedPrimary = JSON.parse(readFileSync(filePath, 'utf8'));
+  const repairedBackup = JSON.parse(readFileSync(backupPath, 'utf8'));
+  assert.equal(repairedPrimary.revision, 3);
+  assert.deepEqual(repairedPrimary, repairedBackup);
+});
+
+test('repairs an older valid backup from the newer valid primary revision', () => {
+  const filePath = tempPath();
+  const backupPath = `${filePath}.bak`;
+  writeFileSync(backupPath, JSON.stringify({
+    schemaVersion: 2,
+    revision: 1,
+    nextSequence: 1,
+    items: [],
+  }));
+  writeFileSync(filePath, JSON.stringify({
+    schemaVersion: 2,
+    revision: 2,
+    nextSequence: 1,
+    items: [],
+  }));
+
+  new OutboxStore(filePath);
+
+  const repairedPrimary = JSON.parse(readFileSync(filePath, 'utf8'));
+  const repairedBackup = JSON.parse(readFileSync(backupPath, 'utf8'));
+  assert.equal(repairedPrimary.revision, 3);
+  assert.deepEqual(repairedPrimary, repairedBackup);
+});
+
+test('repairs a syntactically corrupt backup from a valid primary', () => {
+  const filePath = tempPath();
+  const backupPath = `${filePath}.bak`;
+  writeFileSync(filePath, JSON.stringify({
+    schemaVersion: 2,
+    revision: 2,
+    nextSequence: 1,
+    items: [],
+  }));
+  writeFileSync(backupPath, '{ invalid backup json');
+
+  new OutboxStore(filePath);
+
+  const repairedPrimary = JSON.parse(readFileSync(filePath, 'utf8'));
+  const repairedBackup = JSON.parse(readFileSync(backupPath, 'utf8'));
+  assert.equal(repairedPrimary.revision, 3);
+  assert.deepEqual(repairedPrimary, repairedBackup);
+});
+
 test('batch enqueue is atomic when a later final item exceeds capacity', () => {
   const store = new OutboxStore(tempPath(), { maxItemsPerUser: 1 });
   const existing = store.enqueueText(input({ itemId: 'existing' }));
@@ -1485,6 +1588,43 @@ test('recovered failures append to the active FIFO tail in stable relative order
     reloaded.listPending('user-a').slice(-2).map((item) => item.recoveryAttempts),
     [1, 1],
   );
+});
+
+test('accepts zero terminal retention budgets and immediately drops failures', () => {
+  const store = new OutboxStore(tempPath(), {
+    maxFailedItemsPerUser: 0,
+    maxFailedBytesPerUser: 0,
+    failedRetentionMs: 0,
+  });
+  const failed = store.enqueue(input({ itemId: 'zero-retention' }));
+
+  assert.equal(
+    store.markPermanentFailure(failed.itemId, { httpStatus: 400 }, 'deterministic-rejection'),
+    true,
+  );
+  assert.equal(store.get(failed.itemId), undefined);
+});
+
+test('rejects invalid terminal retention options with named configuration errors', async (t) => {
+  const invalidValues = [NaN, Infinity, -1, 1.5, Number.MAX_SAFE_INTEGER + 1];
+  for (const option of [
+    'maxFailedItemsPerUser',
+    'maxFailedBytesPerUser',
+    'failedRetentionMs',
+  ] as const) {
+    for (const value of invalidValues) {
+      await t.test(`${option}=${String(value)}`, () => {
+        assert.throws(
+          () => new OutboxStore(tempPath(), { [option]: value }),
+          (error: unknown) => {
+            assert.ok(error instanceof OutboxMigrationError);
+            assert.match(error.message, new RegExp(`${option}.*non-negative safe integer`, 'i'));
+            return true;
+          },
+        );
+      });
+    }
+  }
 });
 
 test('restart preserves recovery attempts and enforces the next backoff', () => {

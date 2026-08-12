@@ -58,6 +58,10 @@ test('recovery diagnostics keep metadata but never persist payloads or credentia
     text: 'secret-message-body',
     token: 'secret-context-token',
     rawBody: { response: 'secret-raw-response' },
+    payload: {
+      text: 'nested-secret-message-body',
+      credentials: { password: 'nested-secret-password' },
+    },
   });
 
   const line = readFileSync(filePath, 'utf8').trim();
@@ -66,11 +70,15 @@ test('recovery diagnostics keep metadata but never persist payloads or credentia
   assert.equal(parsed.failureKind, 'expired-before-delivery');
   assert.equal(parsed.ageMs, 300_000);
   assert.equal(parsed.attempt, 2);
-  assert.equal(parsed.token, '***');
-  assert.equal(parsed.rawBody, '***');
+  assert.equal(Object.hasOwn(parsed, 'text'), false);
+  assert.equal(Object.hasOwn(parsed, 'token'), false);
+  assert.equal(Object.hasOwn(parsed, 'rawBody'), false);
+  assert.equal(Object.hasOwn(parsed, 'payload'), false);
   assert.ok(!line.includes('secret-message-body'));
   assert.ok(!line.includes('secret-context-token'));
   assert.ok(!line.includes('secret-raw-response'));
+  assert.ok(!line.includes('nested-secret-message-body'));
+  assert.ok(!line.includes('nested-secret-password'));
 });
 
 test('diagnostic filesystem failures never escape into message processing', () => {

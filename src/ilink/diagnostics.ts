@@ -27,6 +27,15 @@ const SECRET_KEYS = new Set([
 ]);
 const USER_ID_KEYS = new Set(['userid', 'from_user_id', 'to_user_id']);
 const TEXT_KEYS = new Set(['text', 'body', 'errmsg', 'errormessage', 'message']);
+const RECOVERY_KEYS = new Set([
+  'event',
+  'userId',
+  'itemId',
+  'count',
+  'failureKind',
+  'ageMs',
+  'attempt',
+]);
 
 export class DeliveryDiagnostics {
   private readonly maxTextBytes: number;
@@ -48,8 +57,8 @@ export class DeliveryDiagnostics {
   record(event: DeliveryDiagnosticEvent): void {
     if (this.disabled) return;
     try {
-      const recoverySafeEvent = event.event === 'outbox-recovery' && Object.hasOwn(event, 'text')
-        ? { ...event, text: '***' }
+      const recoverySafeEvent = event.event === 'outbox-recovery'
+        ? Object.fromEntries(Object.entries(event).filter(([key]) => RECOVERY_KEYS.has(key)))
         : event;
       const sanitized = redactDiagnostic(
         { timestamp: this.now(), ...recoverySafeEvent },

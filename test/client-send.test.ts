@@ -885,6 +885,44 @@ test('a fresh inbound automatically requeues one eligible expired failure before
   });
 });
 
+test('recovery diagnostics report one truthful event per recovered item', async () => {
+  const options = paths();
+  let now = 1_000;
+  const outbox = new OutboxStore(options.outboxPath, {
+    now: () => now,
+    defaultTtlMs: 100,
+  });
+  const quota = new QuotaManager(options.quotaPath, 'account-a');
+  for (const itemId of ['diagnostic-recovery-1', 'diagnostic-recovery-2']) {
+    outbox.enqueue({
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 0,
+      tokenVersion: 0,
+      priority: 'final',
+      itemId,
+      clientId: `${itemId}-client`,
+      text: `${itemId}-body`,
+      createdAt: now,
+      ttlMs: 1,
+    });
+  }
+  now += 1;
+
+  const client = new ILinkClient(CREDS, { ...options, outbox, quota });
+  await (client as any).processMessage(message(1));
+
+  const events = readFileSync(options.diagnosticsPath, 'utf8')
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line))
+    .filter((event) => event.event === 'outbox-recovery');
+  assert.deepEqual(events.map(({ itemId, count }) => ({ itemId, count })), [
+    { itemId: 'diagnostic-recovery-1', count: 1 },
+    { itemId: 'diagnostic-recovery-2', count: 1 },
+  ]);
+});
+
 test('restart never resends the ambiguous item and resumes only its pending suffix', async () => {
   const options = paths();
   const first = new ILinkClient(CREDS, options);

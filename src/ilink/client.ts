@@ -421,7 +421,8 @@ export class ILinkClient {
       this.diagnostics.record({
         event: 'outbox-recovery',
         userId: msg.from_user_id,
-        count: recovered.length,
+        itemId: item.itemId,
+        count: 1,
         failureKind: item.kind,
         ageMs: item.ageMs,
         attempt: item.attempt,
