@@ -1608,6 +1608,88 @@ test('repairs a missing backup at max-safe revision without overflowing', () => 
   assert.deepEqual(repairedPrimary, repairedBackup);
 });
 
+test('max-safe migratable primary pure-repairs canonically equal snapshots', () => {
+  const filePath = tempPath();
+  const backupPath = `${filePath}.bak`;
+  const now = 5_000;
+  const canonicalItem = {
+    ...input({ itemId: 'max-safe-equivalent' }),
+    schemaVersion: 2,
+    clientId: 'max-safe-equivalent-client',
+    sequence: 1,
+    kind: 'text',
+    bytes: Buffer.byteLength('frozen body', 'utf8'),
+    createdAt: now,
+    expiresAt: now + 60_000,
+    state: 'permanent-failure',
+    failureKind: 'ambiguous-delivery',
+    failedAt: now,
+    recoveryAttempts: 0,
+  };
+  writeFileSync(filePath, JSON.stringify({
+    schemaVersion: 2,
+    revision: Number.MAX_SAFE_INTEGER,
+    nextSequence: 2,
+    items: [{ ...canonicalItem, state: 'pending', recoveryRequired: true }],
+  }));
+  writeFileSync(backupPath, JSON.stringify({
+    schemaVersion: 2,
+    revision: Number.MAX_SAFE_INTEGER,
+    nextSequence: 2,
+    items: [canonicalItem],
+  }));
+
+  assert.doesNotThrow(() => new OutboxStore(filePath, { now: () => now }));
+
+  const repairedPrimary = JSON.parse(readFileSync(filePath, 'utf8'));
+  const repairedBackup = JSON.parse(readFileSync(backupPath, 'utf8'));
+  assert.equal(repairedPrimary.revision, Number.MAX_SAFE_INTEGER);
+  assert.deepEqual(repairedPrimary, repairedBackup);
+  assert.equal(repairedPrimary.items[0].state, 'permanent-failure');
+  assert.equal(Object.hasOwn(repairedPrimary.items[0], 'recoveryRequired'), false);
+});
+
+test('max-safe canonical primary proactively repairs an equivalent migratable backup', () => {
+  const filePath = tempPath();
+  const backupPath = `${filePath}.bak`;
+  const now = 5_000;
+  const canonicalItem = {
+    ...input({ itemId: 'max-safe-backup-equivalent' }),
+    schemaVersion: 2,
+    clientId: 'max-safe-backup-client',
+    sequence: 1,
+    kind: 'text',
+    bytes: Buffer.byteLength('frozen body', 'utf8'),
+    createdAt: now,
+    expiresAt: now + 60_000,
+    state: 'permanent-failure',
+    failureKind: 'ambiguous-delivery',
+    failedAt: now,
+    recoveryAttempts: 0,
+  };
+  writeFileSync(filePath, JSON.stringify({
+    schemaVersion: 2,
+    revision: Number.MAX_SAFE_INTEGER,
+    nextSequence: 2,
+    items: [canonicalItem],
+  }));
+  writeFileSync(backupPath, JSON.stringify({
+    schemaVersion: 2,
+    revision: Number.MAX_SAFE_INTEGER,
+    nextSequence: 2,
+    items: [{ ...canonicalItem, state: 'pending', recoveryRequired: true }],
+  }));
+
+  new OutboxStore(filePath, { now: () => now });
+
+  const canonical = readFileSync(filePath, 'utf8');
+  assert.equal(readFileSync(backupPath, 'utf8'), canonical);
+  writeFileSync(filePath, '{ corrupt primary');
+  assert.doesNotThrow(() => new OutboxStore(filePath, { now: () => now }));
+  assert.equal(readFileSync(filePath, 'utf8'), canonical);
+  assert.equal(readFileSync(backupPath, 'utf8'), canonical);
+});
+
 test('batch enqueue is atomic when a later final item exceeds capacity', () => {
   const store = new OutboxStore(tempPath(), { maxItemsPerUser: 1 });
   const existing = store.enqueueText(input({ itemId: 'existing' }));

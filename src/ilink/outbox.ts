@@ -519,10 +519,14 @@ export class OutboxStore {
       const selected = (useBackup ? backup.candidate : primary.candidate)!;
       const { snapshot, loaded, normalized } = selected;
       this.revision = loaded.revision;
-      const requiresMigration = loaded.changed
-        || normalized.changed
-        || snapshot.schemaVersion !== 2
-        || !isNonNegativeSafeInteger(snapshot.revision);
+      const requiresMigration = candidateRequiresMigration(selected);
+      const canonicalPeerRepair = primary.candidate !== undefined
+        && backup.candidate !== undefined
+        && isNonNegativeSafeInteger(primary.candidate.snapshot.revision)
+        && primary.candidate.snapshot.revision === backup.candidate.snapshot.revision
+        && sameCanonicalState(primary.candidate.normalized, backup.candidate.normalized)
+        && (candidateRequiresMigration(primary.candidate)
+          || candidateRequiresMigration(backup.candidate));
       const requiresRepair = useBackup
         || (existsSync(this.filePath) && !primary.candidate)
         || (existsSync(this.backupPath) && !backup.candidate)
@@ -536,7 +540,9 @@ export class OutboxStore {
         || (primary.candidate !== undefined
           && backup.candidate !== undefined
           && !sameCanonicalState(primary.candidate.normalized, backup.candidate.normalized));
-      if (requiresMigration) {
+      if (canonicalPeerRepair) {
+        this.persistCurrentRevisionState(normalized.items, normalized.nextSequence);
+      } else if (requiresMigration) {
         this.persistState(normalized.items, normalized.nextSequence);
       } else if (requiresRepair) {
         this.persistRepairState(normalized.items, normalized.nextSequence);
@@ -785,6 +791,20 @@ export class OutboxStore {
     this.revision = revision;
   }
 
+  private persistCurrentRevisionState(items: Map<string, OutboxItem>, nextSequence: number): void {
+    assertPersistableItems(items);
+    assertPersistableSequences(items, nextSequence);
+    const payload: PersistedOutbox = {
+      schemaVersion: 2,
+      revision: this.revision,
+      nextSequence,
+      items: [...items.values()],
+    };
+    const encoded = JSON.stringify(payload, null, 2);
+    atomicWrite(this.backupPath, encoded);
+    atomicWrite(this.filePath, encoded);
+  }
+
   private publish(items: Map<string, OutboxItem>, nextSequence: number): void {
     this.items.clear();
     for (const [itemId, item] of items) this.items.set(itemId, item);
@@ -803,6 +823,13 @@ function sameMigrationBatch(left: OutboxItem, right: OutboxItem): boolean {
 function sameCanonicalState(left: NormalizedOutboxState, right: NormalizedOutboxState): boolean {
   return left.nextSequence === right.nextSequence
     && JSON.stringify([...left.items.values()]) === JSON.stringify([...right.items.values()]);
+}
+
+function candidateRequiresMigration(candidate: DecodedSnapshotCandidate): boolean {
+  return candidate.loaded.changed
+    || candidate.normalized.changed
+    || candidate.snapshot.schemaVersion !== 2
+    || !isNonNegativeSafeInteger(candidate.snapshot.revision);
 }
 
 function compareSnapshotFreshness(left: LegacySnapshot, right: LegacySnapshot): number {
