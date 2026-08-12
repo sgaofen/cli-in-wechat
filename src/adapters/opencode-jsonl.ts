@@ -40,7 +40,11 @@ export function parseOpenCodeJsonl(
     }
 
     const type = nonEmptyString(event.type);
-    const part = record(event.part);
+    const partValue = event.part;
+    const hasStructuredPart = partValue !== null
+      && typeof partValue === 'object'
+      && !Array.isArray(partValue);
+    const part = record(partValue);
     const partText = typeof part.text === 'string' ? part.text : '';
 
     if (!sessionId) {
@@ -57,7 +61,7 @@ export function parseOpenCodeJsonl(
       if (partText.trim()) {
         onIntermediate?.({ type: 'thinking', content: partText });
       }
-    } else if (type === 'tool_use') {
+    } else if (type === 'tool_use' && hasStructuredPart) {
       const toolName = nonEmptyString(part.tool) || 'Tool';
       const state = record(part.state);
       onIntermediate?.({

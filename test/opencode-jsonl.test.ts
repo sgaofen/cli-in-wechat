@@ -58,6 +58,37 @@ test('ignores blank and malformed lines without losing later valid events', () =
   assert.equal(parsed.hasError, false);
 });
 
+test('skips tool_use records with malformed part values and continues with later events', () => {
+  const jsonl = [
+    JSON.stringify({ type: 'tool_use' }),
+    JSON.stringify({ type: 'tool_use', part: null }),
+    JSON.stringify({ type: 'tool_use', part: 'not-an-object' }),
+    JSON.stringify({ type: 'tool_use', part: [] }),
+    JSON.stringify({
+      type: 'tool_use',
+      sessionID: 'ses_after_bad_part',
+      part: {
+        tool: 'bash',
+        state: {
+          input: { command: 'npm test' },
+          output: 'Exit code 0',
+        },
+      },
+    }),
+    JSON.stringify({ type: 'text', part: { text: 'still valid' } }),
+  ].join('\n');
+  const activity: Array<{ type: string; content: string; toolName?: string }> = [];
+  const parsed = parseOpenCodeJsonl(jsonl, (message) => activity.push(message));
+
+  assert.equal(parsed.text, 'still valid');
+  assert.equal(parsed.sessionId, 'ses_after_bad_part');
+  assert.deepEqual(activity, [
+    { type: 'tool_use', content: '- Shell Command: `npm test`', toolName: 'bash' },
+    { type: 'tool_result', content: '  ↳ Exit: 0', toolName: 'bash' },
+    { type: 'text', content: 'still valid' },
+  ]);
+});
+
 test('does not invent de-duplication for repeated JSONL events', () => {
   const line = JSON.stringify({
     type: 'text',
