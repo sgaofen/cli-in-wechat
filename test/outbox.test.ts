@@ -1078,13 +1078,6 @@ test('enforces the byte ceiling per safe record while preserving frozen records'
 
       const store = new OutboxStore(filePath, migrationOptions());
       const loaded = store.list();
-      const expectsWrite = fixture.items.some((item) => item.recoveryRequired === true
-        || (item.state === 'pending'
-        && !item.deliveryReceipt
-        && !item.recoveryRequired
-        && !item.continuationNoticeAttached
-        && Buffer.byteLength(String(item.text), 'utf8') > MIGRATED_BODY_BYTES));
-
       fixture.items.forEach((item, index) => {
         const start = loaded.findIndex((candidate) => candidate.itemId === item.itemId);
         const nextOriginalId = fixture.items[index + 1]?.itemId;
@@ -1124,15 +1117,10 @@ test('enforces the byte ceiling per safe record while preserving frozen records'
         }
       });
 
-      if (expectsWrite) {
-        assert.deepEqual(
-          JSON.parse(readFileSync(filePath, 'utf8')),
-          JSON.parse(readFileSync(`${filePath}.bak`, 'utf8')),
-        );
-      } else {
-        assert.equal(readFileSync(filePath, 'utf8'), before);
-        assert.equal(existsSync(`${filePath}.bak`), false);
-      }
+      assert.deepEqual(
+        JSON.parse(readFileSync(filePath, 'utf8')),
+        JSON.parse(readFileSync(`${filePath}.bak`, 'utf8')),
+      );
     });
   }
 });
@@ -1440,6 +1428,183 @@ test('repairs a syntactically corrupt backup from a valid primary', () => {
   const repairedPrimary = JSON.parse(readFileSync(filePath, 'utf8'));
   const repairedBackup = JSON.parse(readFileSync(backupPath, 'utf8'));
   assert.equal(repairedPrimary.revision, 3);
+  assert.deepEqual(repairedPrimary, repairedBackup);
+});
+
+test('recreates a missing backup from the authoritative valid primary', () => {
+  const filePath = tempPath();
+  const backupPath = `${filePath}.bak`;
+  writeFileSync(filePath, JSON.stringify({
+    schemaVersion: 2,
+    revision: 2,
+    nextSequence: 1,
+    items: [],
+  }));
+
+  new OutboxStore(filePath);
+
+  const repairedPrimary = JSON.parse(readFileSync(filePath, 'utf8'));
+  const repairedBackup = JSON.parse(readFileSync(backupPath, 'utf8'));
+  assert.equal(repairedPrimary.revision, 3);
+  assert.deepEqual(repairedPrimary, repairedBackup);
+});
+
+test('equal-revision divergence keeps primary authoritative and repairs backup', () => {
+  const filePath = tempPath();
+  const backupPath = `${filePath}.bak`;
+  const primaryItem = {
+    ...input({ itemId: 'primary-authoritative' }),
+    schemaVersion: 2,
+    clientId: 'primary-client',
+    sequence: 1,
+    kind: 'text',
+    bytes: Buffer.byteLength('frozen body', 'utf8'),
+    createdAt: Date.now(),
+    expiresAt: Date.now() + 60_000,
+    state: 'pending',
+  };
+  const backupOnlyItem = {
+    ...primaryItem,
+    itemId: 'backup-only-ghost',
+    clientId: 'backup-only-client',
+  };
+  writeFileSync(filePath, JSON.stringify({
+    schemaVersion: 2,
+    revision: 7,
+    nextSequence: 2,
+    items: [primaryItem],
+  }));
+  writeFileSync(backupPath, JSON.stringify({
+    schemaVersion: 2,
+    revision: 7,
+    nextSequence: 2,
+    items: [backupOnlyItem],
+  }));
+
+  const recovered = new OutboxStore(filePath);
+
+  assert.deepEqual(recovered.listPending('user-a').map((item) => item.itemId), [
+    'primary-authoritative',
+  ]);
+  const repairedPrimary = JSON.parse(readFileSync(filePath, 'utf8'));
+  const repairedBackup = JSON.parse(readFileSync(backupPath, 'utf8'));
+  assert.equal(repairedPrimary.revision, 8);
+  assert.deepEqual(repairedPrimary, repairedBackup);
+  assert.equal(repairedPrimary.items[0].itemId, 'primary-authoritative');
+});
+
+test('canonicalizes invalid revisions once and keeps restart idempotency', async (t) => {
+  for (const [name, revision] of [
+    ['fractional', 1.5],
+    ['negative', -1],
+    ['unsafe', Number.MAX_SAFE_INTEGER + 1],
+  ] as const) {
+    await t.test(name, () => {
+      const filePath = tempPath();
+      writeFileSync(filePath, JSON.stringify({
+        schemaVersion: 2,
+        revision,
+        nextSequence: 1,
+        items: [],
+      }));
+
+      new OutboxStore(filePath);
+
+      const canonical = readFileSync(filePath, 'utf8');
+      assert.equal(JSON.parse(canonical).revision, 1);
+      assert.equal(readFileSync(`${filePath}.bak`, 'utf8'), canonical);
+
+      new OutboxStore(filePath);
+      assert.equal(readFileSync(filePath, 'utf8'), canonical);
+      assert.equal(readFileSync(`${filePath}.bak`, 'utf8'), canonical);
+    });
+  }
+});
+
+test('a valid revision outranks an unsafe-revision snapshot with a larger sequence', () => {
+  const filePath = tempPath();
+  const backupPath = `${filePath}.bak`;
+  const primaryItem = {
+    ...input({ itemId: 'valid-revision-item' }),
+    schemaVersion: 2,
+    clientId: 'valid-revision-client',
+    sequence: 1,
+    kind: 'text',
+    bytes: Buffer.byteLength('frozen body', 'utf8'),
+    createdAt: Date.now(),
+    expiresAt: Date.now() + 60_000,
+    state: 'pending',
+  };
+  writeFileSync(filePath, JSON.stringify({
+    schemaVersion: 2,
+    revision: 2,
+    nextSequence: 2,
+    items: [primaryItem],
+  }));
+  writeFileSync(backupPath, JSON.stringify({
+    schemaVersion: 2,
+    revision: Number.MAX_SAFE_INTEGER + 1,
+    nextSequence: Number.MAX_SAFE_INTEGER,
+    items: [],
+  }));
+
+  const recovered = new OutboxStore(filePath);
+
+  assert.deepEqual(recovered.listPending('user-a').map((item) => item.itemId), [
+    'valid-revision-item',
+  ]);
+  const repairedPrimary = JSON.parse(readFileSync(filePath, 'utf8'));
+  const repairedBackup = JSON.parse(readFileSync(backupPath, 'utf8'));
+  assert.equal(repairedPrimary.revision, 3);
+  assert.deepEqual(repairedPrimary, repairedBackup);
+});
+
+test('keeps max-safe revisions restart-idempotent and rejects an unsafe successor', () => {
+  const filePath = tempPath();
+  const backupPath = `${filePath}.bak`;
+  const encoded = JSON.stringify({
+    schemaVersion: 2,
+    revision: Number.MAX_SAFE_INTEGER,
+    nextSequence: 1,
+    items: [],
+  });
+  writeFileSync(filePath, encoded);
+  writeFileSync(backupPath, encoded);
+
+  const store = new OutboxStore(filePath);
+  assert.equal(readFileSync(filePath, 'utf8'), encoded);
+  assert.equal(readFileSync(backupPath, 'utf8'), encoded);
+
+  assert.throws(
+    () => store.enqueue(input({ itemId: 'revision-overflow' })),
+    (error: unknown) => {
+      assert.ok(error instanceof OutboxMigrationError);
+      assert.match(error.message, /revision capacity/i);
+      return true;
+    },
+  );
+  assert.equal(readFileSync(filePath, 'utf8'), encoded);
+  assert.equal(readFileSync(backupPath, 'utf8'), encoded);
+  assert.equal(store.get('revision-overflow'), undefined);
+  assert.doesNotThrow(() => new OutboxStore(filePath));
+});
+
+test('repairs a missing backup at max-safe revision without overflowing', () => {
+  const filePath = tempPath();
+  const backupPath = `${filePath}.bak`;
+  const encoded = JSON.stringify({
+    schemaVersion: 2,
+    revision: Number.MAX_SAFE_INTEGER,
+    nextSequence: 1,
+    items: [],
+  });
+  writeFileSync(filePath, encoded);
+
+  assert.doesNotThrow(() => new OutboxStore(filePath));
+
+  const repairedPrimary = JSON.parse(readFileSync(filePath, 'utf8'));
+  const repairedBackup = JSON.parse(readFileSync(backupPath, 'utf8'));
+  assert.equal(repairedPrimary.revision, Number.MAX_SAFE_INTEGER);
   assert.deepEqual(repairedPrimary, repairedBackup);
 });
 

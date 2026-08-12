@@ -512,23 +512,34 @@ export class OutboxStore {
     if (primary.candidate || backup.candidate) {
       const useBackup = Boolean(backup.candidate)
         && (!primary.candidate
-          || this.snapshotFreshness(backup.candidate!.snapshot)
-            > this.snapshotFreshness(primary.candidate.snapshot));
+          || compareSnapshotFreshness(
+            backup.candidate!.snapshot,
+            primary.candidate.snapshot,
+          ) > 0);
       const selected = (useBackup ? backup.candidate : primary.candidate)!;
       const { snapshot, loaded, normalized } = selected;
       this.revision = loaded.revision;
-      if (loaded.changed
+      const requiresMigration = loaded.changed
         || normalized.changed
-        || useBackup
+        || snapshot.schemaVersion !== 2
+        || !isNonNegativeSafeInteger(snapshot.revision);
+      const requiresRepair = useBackup
         || (existsSync(this.filePath) && !primary.candidate)
         || (existsSync(this.backupPath) && !backup.candidate)
+        || (primary.candidate !== undefined && !existsSync(this.backupPath))
         || (primary.candidate !== undefined
           && backup.candidate !== undefined
-          && this.snapshotFreshness(primary.candidate.snapshot)
-            !== this.snapshotFreshness(backup.candidate.snapshot))
-        || snapshot.schemaVersion !== 2
-        || !Number.isInteger(snapshot.revision)) {
+          && compareSnapshotFreshness(
+            primary.candidate.snapshot,
+            backup.candidate.snapshot,
+          ) !== 0)
+        || (primary.candidate !== undefined
+          && backup.candidate !== undefined
+          && !sameCanonicalState(primary.candidate.normalized, backup.candidate.normalized));
+      if (requiresMigration) {
         this.persistState(normalized.items, normalized.nextSequence);
+      } else if (requiresRepair) {
+        this.persistRepairState(normalized.items, normalized.nextSequence);
       }
       this.publish(normalized.items, normalized.nextSequence);
       return;
@@ -560,13 +571,6 @@ export class OutboxStore {
     }
   }
 
-  private snapshotFreshness(snapshot: LegacySnapshot): number {
-    if (Number.isInteger(snapshot.revision) && snapshot.revision! >= 0) {
-      return Number.MAX_SAFE_INTEGER / 2 + snapshot.revision!;
-    }
-    return asFiniteNumber(snapshot.nextSequence, 0);
-  }
-
   private readSnapshot(filePath: string): LegacySnapshot | undefined {
     if (!existsSync(filePath)) return undefined;
     try {
@@ -582,7 +586,7 @@ export class OutboxStore {
     const items = new Map<string, OutboxItem>();
     const requiresStableIds = snapshot.schemaVersion === 2;
     let maxSequence = 0;
-    let changed = false;
+    let changed = !isNonNegativeSafeInteger(snapshot.revision);
     for (const [index, raw] of (snapshot.items ?? []).entries()) {
       if (!raw || typeof raw !== 'object') {
         throw new OutboxMigrationError(`invalid item at index ${index}: expected an object`);
@@ -649,7 +653,7 @@ export class OutboxStore {
     }
     const persistedNextSequence = asPositiveSafeInteger(snapshot.nextSequence);
     return {
-      revision: asFiniteNumber(snapshot.revision, 0),
+      revision: isNonNegativeSafeInteger(snapshot.revision) ? snapshot.revision : 0,
       nextSequence: persistedNextSequence !== undefined && persistedNextSequence > maxSequence
         ? persistedNextSequence
         : nextSafeSequence(maxSequence),
@@ -758,6 +762,22 @@ export class OutboxStore {
     assertPersistableItems(items);
     assertPersistableSequences(items, nextSequence);
     const revision = this.revision + 1;
+    if (!Number.isSafeInteger(revision) || revision < 0) {
+      throw new OutboxMigrationError('revision capacity exhausted; no safe successor remains');
+    }
+    const payload: PersistedOutbox = { schemaVersion: 2, revision, nextSequence, items: [...items.values()] };
+    const encoded = JSON.stringify(payload, null, 2);
+    atomicWrite(this.backupPath, encoded);
+    atomicWrite(this.filePath, encoded);
+    this.revision = revision;
+  }
+
+  private persistRepairState(items: Map<string, OutboxItem>, nextSequence: number): void {
+    assertPersistableItems(items);
+    assertPersistableSequences(items, nextSequence);
+    const revision = this.revision === Number.MAX_SAFE_INTEGER
+      ? this.revision
+      : this.revision + 1;
     const payload: PersistedOutbox = { schemaVersion: 2, revision, nextSequence, items: [...items.values()] };
     const encoded = JSON.stringify(payload, null, 2);
     atomicWrite(this.backupPath, encoded);
@@ -778,6 +798,24 @@ function sameMigrationBatch(left: OutboxItem, right: OutboxItem): boolean {
     && left.generation === right.generation
     && left.tokenVersion === right.tokenVersion
     && left.priority === right.priority;
+}
+
+function sameCanonicalState(left: NormalizedOutboxState, right: NormalizedOutboxState): boolean {
+  return left.nextSequence === right.nextSequence
+    && JSON.stringify([...left.items.values()]) === JSON.stringify([...right.items.values()]);
+}
+
+function compareSnapshotFreshness(left: LegacySnapshot, right: LegacySnapshot): number {
+  const leftHasRevision = isNonNegativeSafeInteger(left.revision);
+  const rightHasRevision = isNonNegativeSafeInteger(right.revision);
+  if (leftHasRevision && rightHasRevision) {
+    return left.revision! === right.revision! ? 0 : left.revision! > right.revision! ? 1 : -1;
+  }
+  if (leftHasRevision) return 1;
+  if (rightHasRevision) return -1;
+  const leftSequence = asFiniteNumber(left.nextSequence, 0);
+  const rightSequence = asFiniteNumber(right.nextSequence, 0);
+  return leftSequence === rightSequence ? 0 : leftSequence > rightSequence ? 1 : -1;
 }
 
 function canRechunkPendingItem(item: OutboxItem): boolean {
@@ -918,6 +956,10 @@ function isValidDeliveryReceipt(value: unknown): value is NonNullable<OutboxItem
 
 function asFiniteNumber(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
 function nonNegativeSafeIntegerOption(name: string, value: number | undefined, fallback: number): number {
