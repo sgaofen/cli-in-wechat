@@ -182,14 +182,26 @@ const TOOL_ALIASES = {
 
 - 默认访问范围是扫码认证的 owner。只有显式 `allowAllUsers: true` 才允许公共访问；不要
   用空 allowlist 推导“允许所有人”。
-- 凭据、context token、媒体加密参数、完整下载 URL、prompt 和大段消息正文不得写入
-  普通日志或持久化诊断；使用现有脱敏函数并添加回归测试。
+- 持久化的 `DeliveryDiagnostics` 在写入前必须通过 `redactDiagnostic()` 脱敏；这项保证
+  不覆盖普通调试日志。调试日志可能包含 prompt 片段、消息正文或 URL，属于敏感数据，
+  不得提交或分享。
 - `~/.wx-ai-bridge` 中的凭据、session、outbox、quota、cursor 和 diagnostics 是运行时
   私有数据，不得提交、复制进 fixture 或在错误信息中完整输出。
+- 单实例所有权由操作系统 pipe/socket 端点仲裁，而不是仅凭 PID 或 lock 文件判断；第二个
+  owner 必须被拒绝，过期 lock 即使记录了仍存活的无关 PID，也不能阻止新实例取得所有权。
+- `wcli send` 必须委托给已运行的 bridge；若启动竞争中获取所有权失败，必须重试向现有
+  bridge 发起请求。
+- `release()` 只有在 lock 中的 `instanceId` 仍属于当前实例时才能删除该 lock。
 - 收到的文件名必须经过安全化，禁止路径穿越、隐藏文件和控制字符；媒体格式以 magic
   bytes 校验，不只信任扩展名。
 - 不得把用户 prompt 拼进 shell 命令；新增进程调用必须覆盖 Windows 特殊字符场景。
 - 原子写入和 schema 校验是恢复保证的一部分，不要用普通覆盖写替代。
+
+修改上述行为时至少运行：
+
+```bash
+node --import tsx --test test/single-instance.test.ts test/send.test.ts test/diagnostics.test.ts
+```
 
 ## 变更边界
 
