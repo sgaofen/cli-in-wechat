@@ -44,6 +44,35 @@ test('redactDiagnostic preserves structured delivery counters', () => {
   assert.equal(output.body.count, 2);
 });
 
+test('recovery diagnostics keep metadata but never persist payloads or credentials', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'quota-v2-recovery-diagnostics-'));
+  const filePath = join(dir, 'delivery.jsonl');
+  const diagnostics = new DeliveryDiagnostics(filePath);
+
+  diagnostics.record({
+    event: 'outbox-recovery',
+    count: 2,
+    failureKind: 'expired-before-delivery',
+    ageMs: 300_000,
+    attempt: 2,
+    text: 'secret-message-body',
+    token: 'secret-context-token',
+    rawBody: { response: 'secret-raw-response' },
+  });
+
+  const line = readFileSync(filePath, 'utf8').trim();
+  const parsed = JSON.parse(line) as any;
+  assert.equal(parsed.count, 2);
+  assert.equal(parsed.failureKind, 'expired-before-delivery');
+  assert.equal(parsed.ageMs, 300_000);
+  assert.equal(parsed.attempt, 2);
+  assert.equal(parsed.token, '***');
+  assert.equal(parsed.rawBody, '***');
+  assert.ok(!line.includes('secret-message-body'));
+  assert.ok(!line.includes('secret-context-token'));
+  assert.ok(!line.includes('secret-raw-response'));
+});
+
 test('diagnostic filesystem failures never escape into message processing', () => {
   const dir = mkdtempSync(join(tmpdir(), 'quota-v2-diagnostics-failure-'));
   const blockedParent = join(dir, 'not-a-directory');

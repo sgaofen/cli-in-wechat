@@ -23,6 +23,7 @@ const SECRET_KEYS = new Set([
   'full_url',
   'url',
   'signedurl',
+  'rawbody',
 ]);
 const USER_ID_KEYS = new Set(['userid', 'from_user_id', 'to_user_id']);
 const TEXT_KEYS = new Set(['text', 'body', 'errmsg', 'errormessage', 'message']);
@@ -47,7 +48,13 @@ export class DeliveryDiagnostics {
   record(event: DeliveryDiagnosticEvent): void {
     if (this.disabled) return;
     try {
-      const sanitized = redactDiagnostic({ timestamp: this.now(), ...event }, this.maxTextBytes);
+      const recoverySafeEvent = event.event === 'outbox-recovery' && Object.hasOwn(event, 'text')
+        ? { ...event, text: '***' }
+        : event;
+      const sanitized = redactDiagnostic(
+        { timestamp: this.now(), ...recoverySafeEvent },
+        this.maxTextBytes,
+      );
       appendFileSync(this.filePath, `${JSON.stringify(sanitized)}\n`, 'utf8');
     } catch (error) {
       this.disable(error);
@@ -64,7 +71,7 @@ export class DeliveryDiagnostics {
 export function redactDiagnostic(value: unknown, maxTextBytes = 500, key = ''): unknown {
   const normalizedKey = key.toLowerCase();
   if (SECRET_KEYS.has(normalizedKey)) {
-    return typeof value === 'string' && value.length > 0 ? '***' : value;
+    return value === undefined || value === null || value === '' ? value : '***';
   }
   if (USER_ID_KEYS.has(normalizedKey) && typeof value === 'string') {
     return value.length > 8 ? `${value.slice(0, 8)}...` : value;
