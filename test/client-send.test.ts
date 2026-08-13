@@ -305,7 +305,7 @@ test('keeps all streamed body chunks ahead of a final footer across windows', as
   });
 });
 
-test('ambiguous response keeps the frozen client id for the next recovery attempt', async () => {
+test('ambiguous response preserves frozen identity but never retries on a later inbound', async () => {
   const client = new ILinkClient(CREDS, paths());
   await (client as any).processMessage(message(1));
   const outbox = (client as any).outbox;
@@ -317,19 +317,24 @@ test('ambiguous response keeps the frozen client id for the next recovery attemp
   await withFetchResponses([''], async (requests) => {
     const result = await client.recoverPending('user-a');
     assert.equal(result[0].status, 'ambiguous');
-    assert.equal(outbox.listPending('user-a')[0].recoveryRequired, true);
+    const failed = outbox.list('user-a').find((item: any) => item.itemId === 'ambiguous-final');
+    assert.equal(failed.state, 'permanent-failure');
+    assert.equal(failed.failureKind, 'ambiguous-delivery');
+    assert.equal(failed.text, 'body');
     const firstClientId = requests[0].body.msg.client_id;
+    assert.equal(failed.clientId, firstClientId);
 
     await withFetchResponses([{ ret: 0 }], async (sameInboundRequests) => {
       await client.recoverPending('user-a');
       assert.equal(sameInboundRequests.length, 0);
-      assert.equal(client.getDeliveryState('user-a').state, 'WAITING_INBOUND');
+      assert.equal(client.getDeliveryState('user-a').state, 'PERMANENT_FAILURE');
     });
 
     await withFetchResponses([{ ret: 0 }], async (retryRequests) => {
       await processInboundAndRecover(client, message(2));
-      assert.equal(retryRequests[0].body.msg.client_id, firstClientId);
+      assert.equal(retryRequests.length, 0);
       assert.equal(outbox.listPending('user-a').length, 0);
+      assert.equal(outbox.get('ambiguous-final')?.clientId, firstClientId);
     });
   });
 });
@@ -734,14 +739,15 @@ test('a fresh inbound during an in-flight confirmed send does not relabel it amb
   }
 });
 
-test('non-rate ret=-2 is ambiguous and remains durable for recovery', async () => {
+test('non-rate ret=-2 is terminal ambiguous and remains durable without retry', async () => {
   const client = new ILinkClient(CREDS, paths());
   await (client as any).processMessage(message(1));
   await withFetchResponses([{ ret: -2, errmsg: 'temporary scheduler failure' }], async (requests) => {
     const result = await client.sendText('user-a', 'body');
     assert.equal(result[0].status, 'ambiguous');
     assert.equal(requests.length, 1);
-    assert.equal((client as any).outbox.listPending('user-a')[0].recoveryRequired, true);
+    assert.equal(client.getDeliveryStatus('user-a').pending.length, 0);
+    assert.equal(client.getDeliveryStatus('user-a').failed[0].failureKind, 'ambiguous-delivery');
   });
 });
 
@@ -770,8 +776,7 @@ test('HTTP 400 permanently fails only the bad item and unblocks the FIFO suffix'
   }) as typeof fetch;
   try {
     const first = await client.recoverPending('user-a');
-    assert.equal(first[0].status, 'permanent-failure');
-    await client.recoverPending('user-a');
+    assert.deepEqual(first.map((result) => result.status), ['permanent-failure', 'sent']);
 
     assert.equal(requests, 2);
     assert.equal(client.getDeliveryStatus('user-a').pending.length, 0);
@@ -794,7 +799,8 @@ test('an unconfirmed transport failure becomes ambiguous without an immediate re
     const result = await client.sendText('user-a', 'ambiguous transport');
     assert.equal(result[0].status, 'ambiguous');
     assert.equal(requests, 1);
-    assert.equal(client.getDeliveryStatus('user-a').pending[0].recoveryRequired, true);
+    assert.equal(client.getDeliveryStatus('user-a').pending.length, 0);
+    assert.equal(client.getDeliveryStatus('user-a').failed[0].failureKind, 'ambiguous-delivery');
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -836,7 +842,88 @@ test('a fresh inbound without a context token keeps the last usable token', asyn
   assert.equal(client.getContextToken('user-a'), 'token-a');
 });
 
-test('restart after the seventh confirmed chunk resumes the ambiguous item with the same client id', async () => {
+test('a fresh inbound automatically requeues one eligible expired failure before recovery', async () => {
+  const options = paths();
+  let now = 1_000;
+  const outbox = new OutboxStore(options.outboxPath, {
+    now: () => now,
+    defaultTtlMs: 100,
+  });
+  const quota = new QuotaManager(options.quotaPath, 'account-a');
+  const expired = outbox.enqueue({
+    accountId: 'account-a',
+    userId: 'user-a',
+    generation: 0,
+    tokenVersion: 0,
+    priority: 'final',
+    itemId: 'auto-recover-expired',
+    clientId: 'auto-recover-client',
+    text: 'recoverable body',
+    createdAt: now,
+    ttlMs: 1,
+  });
+  now += 1;
+  assert.equal(outbox.get(expired.itemId)?.failureKind, 'expired-before-delivery');
+
+  const client = new ILinkClient(CREDS, { ...options, outbox, quota });
+  let handlerCalls = 0;
+  client.onMessage(async (inbound) => {
+    handlerCalls += 1;
+    await client.recoverPending(inbound.from_user_id);
+  });
+
+  await withFetchResponses([{ ret: 0 }], async (requests) => {
+    const inbound = message(1);
+    await (client as any).processMessage(inbound);
+    await (client as any).processMessage(inbound);
+
+    assert.equal(handlerCalls, 1);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].body.msg.client_id, 'auto-recover-client');
+    assert.equal(requests[0].body.msg.item_list[0].text_item.text, 'recoverable body');
+    assert.equal(outbox.get(expired.itemId), undefined);
+  });
+});
+
+test('recovery diagnostics report one truthful event per recovered item', async () => {
+  const options = paths();
+  let now = 1_000;
+  const outbox = new OutboxStore(options.outboxPath, {
+    now: () => now,
+    defaultTtlMs: 100,
+  });
+  const quota = new QuotaManager(options.quotaPath, 'account-a');
+  for (const itemId of ['diagnostic-recovery-1', 'diagnostic-recovery-2']) {
+    outbox.enqueue({
+      accountId: 'account-a',
+      userId: 'user-a',
+      generation: 0,
+      tokenVersion: 0,
+      priority: 'final',
+      itemId,
+      clientId: `${itemId}-client`,
+      text: `${itemId}-body`,
+      createdAt: now,
+      ttlMs: 1,
+    });
+  }
+  now += 1;
+
+  const client = new ILinkClient(CREDS, { ...options, outbox, quota });
+  await (client as any).processMessage(message(1));
+
+  const events = readFileSync(options.diagnosticsPath, 'utf8')
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line))
+    .filter((event) => event.event === 'outbox-recovery');
+  assert.deepEqual(events.map(({ itemId, count }) => ({ itemId, count })), [
+    { itemId: 'diagnostic-recovery-1', count: 1 },
+    { itemId: 'diagnostic-recovery-2', count: 1 },
+  ]);
+});
+
+test('restart never resends the ambiguous item and resumes only its pending suffix', async () => {
   const options = paths();
   const first = new ILinkClient(CREDS, options);
   await (first as any).processMessage(message(1));
@@ -855,14 +942,19 @@ test('restart after the seventh confirmed chunk resumes the ambiguous item with 
   ];
   await withFetchResponses(responses, async (requests) => {
     const firstResult = await first.recoverPending('user-a');
-    assert.equal(firstResult.filter((result) => result.status === 'sent').length, 7);
-    assert.equal(firstResult.at(-1)?.status, 'ambiguous');
+    assert.equal(firstResult.filter((result) => result.status === 'sent').length, 9);
+    assert.equal(firstResult.find((result) => result.status === 'ambiguous')?.itemId, 'restart-seven-8');
     const ambiguousClientId = requests[7].body.msg.client_id;
 
     const restarted = new ILinkClient(CREDS, options);
     await processInboundAndRecover(restarted, message(2));
-    assert.equal(requests[8].body.msg.client_id, ambiguousClientId);
+    assert.equal(
+      requests.filter((request) => request.body.msg.client_id === ambiguousClientId).length,
+      1,
+    );
     assert.equal(restarted.getDeliveryStatus('user-a').pending.length, 0);
+    assert.equal(restarted.getDeliveryStatus('user-a').failed[0].itemId, 'restart-seven-8');
+    assert.equal(restarted.getDeliveryStatus('user-a').failed[0].failureKind, 'ambiguous-delivery');
   });
 });
 

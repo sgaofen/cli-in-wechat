@@ -335,6 +335,52 @@ test('exec tags streamed answer text as intermediate and tool activity as activi
   assert.equal(messages.at(-1)?.options?.priority, 'final');
 });
 
+test('compact normal and verbose preserve delivery content order and priorities', async (t) => {
+  for (const mode of ['compact', 'normal', 'verbose'] as const) {
+    await t.test(mode, async () => {
+      const { router, sessions, messages } = createRouter();
+      sessions.update('u1', { msgMode: mode } as any);
+      (router as any).registry.get = () => ({
+        name: 'codex',
+        displayName: 'Codex',
+        capabilities: { sessionResume: false },
+        execute: async (_prompt: string, options: any) => {
+          options.onIntermediate?.({ type: 'text', content: 'streamed answer' });
+          options.onIntermediate?.({ type: 'tool_use', content: '- Shell Command: pwd' });
+          return { text: 'streamed answer', duration: 1_000, error: false };
+        },
+      });
+
+      await router.exec('u1', 'codex', 'hello', undefined, 7);
+
+      assert.ok(messages.every((message) => message.options?.generation === 7));
+      if (mode === 'compact') {
+        assert.equal(messages.length, 1);
+        assert.equal(messages[0].options?.priority, 'final');
+        assert.match(messages[0].text, /^streamed answer/);
+        assert.doesNotMatch(messages[0].text, /Activity|后续内容已排队/);
+        return;
+      }
+
+      assert.equal(messages[0].text, 'streamed answer');
+      assert.equal(messages[0].options?.priority, 'intermediate');
+      if (mode === 'normal') {
+        assert.equal(messages.length, 2);
+        assert.equal(messages[1].options?.priority, 'final');
+        assert.match(messages[1].text, /^Activity\n- Shell Command: pwd/);
+        assert.doesNotMatch(messages[1].text, /streamed answer|后续内容已排队/);
+        return;
+      }
+
+      assert.equal(messages.length, 3);
+      assert.equal(messages[1].text, 'Activity\n- Shell Command: pwd');
+      assert.equal(messages[1].options?.priority, 'activity');
+      assert.equal(messages[2].options?.priority, 'final');
+      assert.doesNotMatch(messages[2].text, /streamed answer|Activity|后续内容已排队/);
+    });
+  }
+});
+
 test('exec does not send a failure bubble after confirmed delivery bookkeeping fails', async () => {
   const { router, ilink } = createRouter();
   const attempts: string[] = [];

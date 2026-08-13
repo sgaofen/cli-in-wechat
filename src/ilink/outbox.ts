@@ -7,6 +7,11 @@ import { chunkUtf8Text } from './text-chunk.js';
 
 export type OutboxPriority = 'final' | 'control' | 'media' | 'intermediate' | 'activity';
 export type OutboxState = 'pending' | 'permanent-failure';
+export type OutboxFailureKind =
+  | 'expired-before-delivery'
+  | 'deterministic-rejection'
+  | 'ambiguous-delivery'
+  | 'legacy-unknown';
 
 export interface OutboxError {
   ret?: number;
@@ -38,6 +43,9 @@ export interface OutboxItem {
   continuationNoticeAttached?: boolean;
   recoveryRequired?: boolean;
   terminalError?: OutboxError;
+  failureKind?: OutboxFailureKind;
+  failedAt?: number;
+  recoveryAttempts?: number;
 }
 
 export interface OutboxInput {
@@ -57,11 +65,21 @@ export interface OutboxOptions {
   defaultTtlMs?: number;
   maxItemsPerUser?: number;
   maxBytesPerUser?: number;
+  maxFailedItemsPerUser?: number;
+  maxFailedBytesPerUser?: number;
+  failedRetentionMs?: number;
   finalReserveItems?: number;
   finalReserveBytes?: number;
   bodyChunkBytes?: number;
   inboundItemLimit?: number;
   now?: () => number;
+}
+
+export interface OutboxRecovery {
+  itemId: string;
+  kind: 'expired-before-delivery';
+  ageMs: number;
+  attempt: number;
 }
 
 export class OutboxCapacityError extends Error {
@@ -103,6 +121,7 @@ interface LoadedOutboxState {
   revision: number;
   nextSequence: number;
   items: Map<string, OutboxItem>;
+  changed: boolean;
 }
 
 interface NormalizedOutboxState {
@@ -111,12 +130,22 @@ interface NormalizedOutboxState {
   changed: boolean;
 }
 
+interface DecodedSnapshotCandidate {
+  snapshot: LegacySnapshot;
+  loaded: LoadedOutboxState;
+  normalized: NormalizedOutboxState;
+}
+
 interface DecodedDeliveryState {
   priority: OutboxPriority;
   state: OutboxState;
   deliveryReceipt?: OutboxItem['deliveryReceipt'];
   continuationNoticeAttached?: boolean;
   recoveryRequired?: boolean;
+  failureKind?: OutboxFailureKind;
+  failedAt?: number;
+  recoveryAttempts?: number;
+  changed: boolean;
 }
 
 const OUTBOX_PRIORITIES = new Set<OutboxPriority>([
@@ -128,6 +157,12 @@ const OUTBOX_PRIORITIES = new Set<OutboxPriority>([
 ]);
 
 const DEFAULT_TTL_MS = 7 * 24 * 60 * 60_000;
+const DEFAULT_FAILED_RETENTION_MS = 14 * 24 * 60 * 60_000;
+const DEFAULT_MAX_FAILED_ITEMS_PER_USER = 100;
+const DEFAULT_MAX_FAILED_BYTES_PER_USER = 200_000;
+const MAX_RECOVERY_AGE_MS = 14 * 24 * 60 * 60_000;
+const MAX_RECOVERY_ATTEMPTS = 3;
+const RECOVERY_BACKOFF_MS = [0, 5 * 60_000, 30 * 60_000] as const;
 
 export class OutboxStore {
   private readonly items = new Map<string, OutboxItem>();
@@ -135,6 +170,9 @@ export class OutboxStore {
   private readonly defaultTtlMs: number;
   private readonly maxItemsPerUser: number;
   private readonly maxBytesPerUser: number;
+  private readonly maxFailedItemsPerUser: number;
+  private readonly maxFailedBytesPerUser: number;
+  private readonly failedRetentionMs: number;
   private readonly bodyChunkBytes?: number;
   private readonly inboundItemLimit?: number;
   private readonly now: () => number;
@@ -146,6 +184,21 @@ export class OutboxStore {
     this.defaultTtlMs = options.defaultTtlMs ?? DEFAULT_TTL_MS;
     this.maxItemsPerUser = options.maxItemsPerUser ?? 500;
     this.maxBytesPerUser = options.maxBytesPerUser ?? 1_000_000;
+    this.maxFailedItemsPerUser = nonNegativeSafeIntegerOption(
+      'maxFailedItemsPerUser',
+      options.maxFailedItemsPerUser,
+      DEFAULT_MAX_FAILED_ITEMS_PER_USER,
+    );
+    this.maxFailedBytesPerUser = nonNegativeSafeIntegerOption(
+      'maxFailedBytesPerUser',
+      options.maxFailedBytesPerUser,
+      DEFAULT_MAX_FAILED_BYTES_PER_USER,
+    );
+    this.failedRetentionMs = nonNegativeSafeIntegerOption(
+      'failedRetentionMs',
+      options.failedRetentionMs,
+      DEFAULT_FAILED_RETENTION_MS,
+    );
     if (options.bodyChunkBytes === undefined && options.inboundItemLimit === undefined) {
       this.bodyChunkBytes = undefined;
       this.inboundItemLimit = undefined;
@@ -176,7 +229,7 @@ export class OutboxStore {
   enqueueTextBatch(inputs: OutboxInput[]): OutboxItem[] {
     if (inputs.length === 0) return [];
     const nextItems = new Map(this.items);
-    let changed = this.markExpired(nextItems);
+    let changed = this.expireAndPrune(nextItems);
     let nextSequence = this.nextSequence;
     const result: OutboxItem[] = [];
 
@@ -190,7 +243,9 @@ export class OutboxStore {
       }
       const bytes = Buffer.byteLength(input.text, 'utf8');
       const userItems = [...nextItems.values()].filter((item) =>
-        item.accountId === input.accountId && item.userId === input.userId);
+        item.accountId === input.accountId
+        && item.userId === input.userId
+        && item.state === 'pending');
       this.ensureCapacity(userItems, bytes);
       const createdAt = input.createdAt ?? this.now();
       const sequence = asPositiveSafeInteger(nextSequence);
@@ -268,13 +323,7 @@ export class OutboxStore {
   }
 
   markAmbiguous(itemId: string, error: OutboxError): boolean {
-    const item = this.items.get(itemId);
-    if (!item || item.state !== 'pending') return false;
-    const nextItems = new Map(this.items);
-    nextItems.set(itemId, { ...item, recoveryRequired: true, terminalError: error });
-    this.persistState(nextItems, this.nextSequence);
-    this.publish(nextItems, this.nextSequence);
-    return true;
+    return this.markPermanentFailure(itemId, error, 'ambiguous-delivery');
   }
 
   freezeText(itemId: string, text: string, continuationNoticeAttached = false): OutboxItem | undefined {
@@ -294,7 +343,11 @@ export class OutboxStore {
     return frozen;
   }
 
-  markPermanentFailure(itemId: string, error: OutboxError): boolean {
+  markPermanentFailure(
+    itemId: string,
+    error: OutboxError,
+    failureKind: OutboxFailureKind = 'legacy-unknown',
+  ): boolean {
     const item = this.items.get(itemId);
     if (!item || item.state === 'permanent-failure') return false;
     const nextItems = new Map(this.items);
@@ -303,62 +356,14 @@ export class OutboxStore {
       state: 'permanent-failure',
       recoveryRequired: false,
       terminalError: error,
+      failureKind,
+      failedAt: this.now(),
+      recoveryAttempts: item.recoveryAttempts ?? 0,
     });
+    this.pruneFailed(nextItems);
     this.persistState(nextItems, this.nextSequence);
     this.publish(nextItems, this.nextSequence);
     return true;
-  }
-
-  clearRecoveryRequired(itemId: string): boolean {
-    const item = this.items.get(itemId);
-    if (!item?.recoveryRequired) return false;
-    const nextItems = new Map(this.items);
-    const cleared = { ...item };
-    delete cleared.recoveryRequired;
-    nextItems.set(itemId, cleared);
-    this.persistState(nextItems, this.nextSequence);
-    this.publish(nextItems, this.nextSequence);
-    return true;
-  }
-
-  clearRecoveryRequiredForUser(accountId: string, userId: string): number {
-    const nextItems = new Map(this.items);
-    let changed = 0;
-    for (const [itemId, item] of nextItems) {
-      if (item.accountId !== accountId || item.userId !== userId || !item.recoveryRequired) continue;
-      const cleared = { ...item };
-      delete cleared.recoveryRequired;
-      delete cleared.terminalError;
-      nextItems.set(itemId, cleared);
-      changed += 1;
-    }
-    if (changed > 0) {
-      this.persistState(nextItems, this.nextSequence);
-      this.publish(nextItems, this.nextSequence);
-    }
-    return changed;
-  }
-
-  requeuePermanentFailures(matches: (item: OutboxItem) => boolean): number {
-    const nextItems = new Map(this.items);
-    let changed = 0;
-    for (const [itemId, item] of nextItems) {
-      if (item.state !== 'permanent-failure' || !matches(item)) continue;
-      const requeued = {
-        ...item,
-        state: 'pending',
-        expiresAt: item.expiresAt <= this.now() ? this.now() + this.defaultTtlMs : item.expiresAt,
-      } satisfies OutboxItem;
-      delete requeued.recoveryRequired;
-      delete requeued.terminalError;
-      nextItems.set(itemId, requeued);
-      changed += 1;
-    }
-    if (changed > 0) {
-      this.persistState(nextItems, this.nextSequence);
-      this.publish(nextItems, this.nextSequence);
-    }
-    return changed;
   }
 
   private ensureCapacity(userItems: OutboxItem[], incomingBytes: number): void {
@@ -371,9 +376,15 @@ export class OutboxStore {
 
   private pruneExpired(): void {
     const nextItems = new Map(this.items);
-    if (!this.markExpired(nextItems)) return;
+    if (!this.expireAndPrune(nextItems)) return;
     this.persistState(nextItems, this.nextSequence);
     this.publish(nextItems, this.nextSequence);
+  }
+
+  private expireAndPrune(target: Map<string, OutboxItem>): boolean {
+    const expired = this.markExpired(target);
+    const pruned = this.pruneFailed(target);
+    return expired || pruned;
   }
 
   private markExpired(target: Map<string, OutboxItem>): boolean {
@@ -384,6 +395,9 @@ export class OutboxStore {
           ...item,
           state: 'permanent-failure',
           terminalError: { errmsg: 'outbox item expired before delivery' },
+          failureKind: 'expired-before-delivery',
+          failedAt: item.expiresAt,
+          recoveryAttempts: item.recoveryAttempts ?? 0,
         });
         changed = true;
       }
@@ -391,32 +405,176 @@ export class OutboxStore {
     return changed;
   }
 
+  recoverExpiredFailures(accountId: string, userId: string): OutboxRecovery[] {
+    const nextItems = new Map(this.items);
+    const expiredOrPruned = this.expireAndPrune(nextItems);
+    const now = this.now();
+    const eligible = [...nextItems.values()]
+      .filter((item) => item.accountId === accountId
+        && item.userId === userId
+        && item.state === 'permanent-failure'
+        && !item.deliveryReceipt
+        && item.failureKind === 'expired-before-delivery'
+        && (item.recoveryAttempts ?? 0) < MAX_RECOVERY_ATTEMPTS
+        && item.failedAt !== undefined
+        && now - item.failedAt >= 0
+        && now - item.failedAt <= MAX_RECOVERY_AGE_MS
+        && now - item.failedAt >= RECOVERY_BACKOFF_MS[item.recoveryAttempts ?? 0])
+      .sort((left, right) => left.sequence - right.sequence
+        || left.itemId.localeCompare(right.itemId));
+
+    let activeCount = 0;
+    let activeBytes = 0;
+    for (const item of nextItems.values()) {
+      if (item.accountId !== accountId || item.userId !== userId || item.state !== 'pending') continue;
+      activeCount += 1;
+      activeBytes += item.bytes;
+    }
+
+    let nextSequence = this.nextSequence;
+    const recovered: OutboxRecovery[] = [];
+    for (const item of eligible) {
+      if (activeCount + 1 > this.maxItemsPerUser
+        || activeBytes + item.bytes > this.maxBytesPerUser) break;
+      const sequence = asPositiveSafeInteger(nextSequence);
+      if (sequence === undefined) throw sequenceCapacityError();
+      nextSequence = nextSafeSequence(sequence);
+      const attempt = (item.recoveryAttempts ?? 0) + 1;
+      const ageMs = now - item.failedAt!;
+      const requeued: OutboxItem = {
+        ...item,
+        sequence,
+        state: 'pending',
+        expiresAt: now + this.defaultTtlMs,
+        recoveryAttempts: attempt,
+      };
+      delete requeued.recoveryRequired;
+      delete requeued.terminalError;
+      delete requeued.failureKind;
+      delete requeued.failedAt;
+      nextItems.delete(item.itemId);
+      nextItems.set(item.itemId, requeued);
+      activeCount += 1;
+      activeBytes += item.bytes;
+      recovered.push({ itemId: item.itemId, kind: 'expired-before-delivery', ageMs, attempt });
+    }
+
+    if (expiredOrPruned || recovered.length > 0) {
+      this.persistState(nextItems, nextSequence);
+      this.publish(nextItems, nextSequence);
+    }
+    return recovered;
+  }
+
+  private pruneFailed(target: Map<string, OutboxItem>): boolean {
+    const failedByUser = new Map<string, OutboxItem[]>();
+    for (const item of target.values()) {
+      if (item.state !== 'permanent-failure') continue;
+      const key = `${item.accountId}\u0000${item.userId}`;
+      const failures = failedByUser.get(key) ?? [];
+      failures.push(item);
+      failedByUser.set(key, failures);
+    }
+
+    let changed = false;
+    for (const failures of failedByUser.values()) {
+      failures.sort((left, right) => (left.failedAt ?? left.createdAt) - (right.failedAt ?? right.createdAt)
+        || left.sequence - right.sequence
+        || left.itemId.localeCompare(right.itemId));
+      const retained: OutboxItem[] = [];
+      for (const item of failures) {
+        const failedAt = item.failedAt ?? item.createdAt;
+        if (this.now() - failedAt > this.failedRetentionMs) {
+          target.delete(item.itemId);
+          changed = true;
+        } else {
+          retained.push(item);
+        }
+      }
+
+      let retainedBytes = retained.reduce((sum, item) => sum + item.bytes, 0);
+      while (retained.length > this.maxFailedItemsPerUser
+        || retainedBytes > this.maxFailedBytesPerUser) {
+        const oldest = retained.shift()!;
+        retainedBytes -= oldest.bytes;
+        target.delete(oldest.itemId);
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
   private load(): void {
-    const primary = this.readSnapshot(this.filePath);
-    const backup = this.readSnapshot(this.backupPath);
-    if (primary || backup) {
-      const useBackup = Boolean(backup)
-        && (!primary || this.snapshotFreshness(backup!) > this.snapshotFreshness(primary));
-      const selected = useBackup ? backup! : primary!;
-      const loaded = this.decodeSnapshot(selected);
-      const normalized = this.normalizeLoadedState(loaded);
+    const primarySnapshot = this.readSnapshot(this.filePath);
+    const backupSnapshot = this.readSnapshot(this.backupPath);
+    const primary = this.decodeSnapshotCandidate(primarySnapshot);
+    const backup = this.decodeSnapshotCandidate(backupSnapshot);
+    if (primary.candidate || backup.candidate) {
+      const useBackup = Boolean(backup.candidate)
+        && (!primary.candidate
+          || compareSnapshotFreshness(
+            backup.candidate!.snapshot,
+            primary.candidate.snapshot,
+          ) > 0);
+      const selected = (useBackup ? backup.candidate : primary.candidate)!;
+      const { snapshot, loaded, normalized } = selected;
       this.revision = loaded.revision;
-      if (normalized.changed || useBackup || selected.schemaVersion !== 2 || !Number.isInteger(selected.revision)) {
+      const requiresMigration = candidateRequiresMigration(selected);
+      const canonicalPeerRepair = primary.candidate !== undefined
+        && backup.candidate !== undefined
+        && isNonNegativeSafeInteger(primary.candidate.snapshot.revision)
+        && primary.candidate.snapshot.revision === backup.candidate.snapshot.revision
+        && sameCanonicalState(primary.candidate.normalized, backup.candidate.normalized)
+        && (candidateRequiresMigration(primary.candidate)
+          || candidateRequiresMigration(backup.candidate));
+      const requiresRepair = useBackup
+        || (existsSync(this.filePath) && !primary.candidate)
+        || (existsSync(this.backupPath) && !backup.candidate)
+        || (primary.candidate !== undefined && !existsSync(this.backupPath))
+        || (primary.candidate !== undefined
+          && backup.candidate !== undefined
+          && compareSnapshotFreshness(
+            primary.candidate.snapshot,
+            backup.candidate.snapshot,
+          ) !== 0)
+        || (primary.candidate !== undefined
+          && backup.candidate !== undefined
+          && !sameCanonicalState(primary.candidate.normalized, backup.candidate.normalized));
+      if (canonicalPeerRepair) {
+        this.persistCurrentRevisionState(normalized.items, normalized.nextSequence);
+      } else if (requiresMigration) {
         this.persistState(normalized.items, normalized.nextSequence);
+      } else if (requiresRepair) {
+        this.persistRepairState(normalized.items, normalized.nextSequence);
       }
       this.publish(normalized.items, normalized.nextSequence);
       return;
     }
+    const semanticError = primary.error ?? backup.error;
+    if (semanticError) throw semanticError;
     if (existsSync(this.filePath) || existsSync(this.backupPath)) {
       throw new OutboxCorruptionError(this.filePath);
     }
   }
 
-  private snapshotFreshness(snapshot: LegacySnapshot): number {
-    if (Number.isInteger(snapshot.revision) && snapshot.revision! >= 0) {
-      return Number.MAX_SAFE_INTEGER / 2 + snapshot.revision!;
+  private decodeSnapshotCandidate(snapshot: LegacySnapshot | undefined): {
+    candidate?: DecodedSnapshotCandidate;
+    error?: OutboxMigrationError;
+  } {
+    if (!snapshot) return {};
+    try {
+      const loaded = this.decodeSnapshot(snapshot);
+      return {
+        candidate: {
+          snapshot,
+          loaded,
+          normalized: this.normalizeLoadedState(loaded),
+        },
+      };
+    } catch (error) {
+      if (error instanceof OutboxMigrationError) return { error };
+      throw error;
     }
-    return asFiniteNumber(snapshot.nextSequence, 0);
   }
 
   private readSnapshot(filePath: string): LegacySnapshot | undefined {
@@ -434,6 +592,7 @@ export class OutboxStore {
     const items = new Map<string, OutboxItem>();
     const requiresStableIds = snapshot.schemaVersion === 2;
     let maxSequence = 0;
+    let changed = !isNonNegativeSafeInteger(snapshot.revision);
     for (const [index, raw] of (snapshot.items ?? []).entries()) {
       if (!raw || typeof raw !== 'object') {
         throw new OutboxMigrationError(`invalid item at index ${index}: expected an object`);
@@ -458,7 +617,8 @@ export class OutboxStore {
       if (items.has(itemId)) {
         throw new OutboxMigrationError(`duplicate itemId at index ${index}: ${itemId}`);
       }
-      const deliveryState = decodeDeliveryState(value, index, requiresStableIds);
+      const deliveryState = decodeDeliveryState(value, index, requiresStableIds, this.now());
+      changed ||= deliveryState.changed;
       const candidateSequence = asPositiveSafeInteger(value.sequence);
       const sequence = candidateSequence !== undefined && candidateSequence > maxSequence
         ? candidateSequence
@@ -488,17 +648,23 @@ export class OutboxStore {
           ? { recoveryRequired: deliveryState.recoveryRequired }
           : {}),
         ...(value.terminalError ? { terminalError: value.terminalError } : {}),
+        ...(deliveryState.failureKind ? { failureKind: deliveryState.failureKind } : {}),
+        ...(deliveryState.failedAt !== undefined ? { failedAt: deliveryState.failedAt } : {}),
+        ...(deliveryState.recoveryAttempts !== undefined
+          ? { recoveryAttempts: deliveryState.recoveryAttempts }
+          : {}),
       };
       items.set(item.itemId, item);
       maxSequence = sequence;
     }
     const persistedNextSequence = asPositiveSafeInteger(snapshot.nextSequence);
     return {
-      revision: asFiniteNumber(snapshot.revision, 0),
+      revision: isNonNegativeSafeInteger(snapshot.revision) ? snapshot.revision : 0,
       nextSequence: persistedNextSequence !== undefined && persistedNextSequence > maxSequence
         ? persistedNextSequence
         : nextSafeSequence(maxSequence),
       items,
+      changed,
     };
   }
 
@@ -602,11 +768,41 @@ export class OutboxStore {
     assertPersistableItems(items);
     assertPersistableSequences(items, nextSequence);
     const revision = this.revision + 1;
+    if (!Number.isSafeInteger(revision) || revision < 0) {
+      throw new OutboxMigrationError('revision capacity exhausted; no safe successor remains');
+    }
     const payload: PersistedOutbox = { schemaVersion: 2, revision, nextSequence, items: [...items.values()] };
     const encoded = JSON.stringify(payload, null, 2);
     atomicWrite(this.backupPath, encoded);
     atomicWrite(this.filePath, encoded);
     this.revision = revision;
+  }
+
+  private persistRepairState(items: Map<string, OutboxItem>, nextSequence: number): void {
+    assertPersistableItems(items);
+    assertPersistableSequences(items, nextSequence);
+    const revision = this.revision === Number.MAX_SAFE_INTEGER
+      ? this.revision
+      : this.revision + 1;
+    const payload: PersistedOutbox = { schemaVersion: 2, revision, nextSequence, items: [...items.values()] };
+    const encoded = JSON.stringify(payload, null, 2);
+    atomicWrite(this.backupPath, encoded);
+    atomicWrite(this.filePath, encoded);
+    this.revision = revision;
+  }
+
+  private persistCurrentRevisionState(items: Map<string, OutboxItem>, nextSequence: number): void {
+    assertPersistableItems(items);
+    assertPersistableSequences(items, nextSequence);
+    const payload: PersistedOutbox = {
+      schemaVersion: 2,
+      revision: this.revision,
+      nextSequence,
+      items: [...items.values()],
+    };
+    const encoded = JSON.stringify(payload, null, 2);
+    atomicWrite(this.backupPath, encoded);
+    atomicWrite(this.filePath, encoded);
   }
 
   private publish(items: Map<string, OutboxItem>, nextSequence: number): void {
@@ -624,6 +820,31 @@ function sameMigrationBatch(left: OutboxItem, right: OutboxItem): boolean {
     && left.priority === right.priority;
 }
 
+function sameCanonicalState(left: NormalizedOutboxState, right: NormalizedOutboxState): boolean {
+  return left.nextSequence === right.nextSequence
+    && JSON.stringify([...left.items.values()]) === JSON.stringify([...right.items.values()]);
+}
+
+function candidateRequiresMigration(candidate: DecodedSnapshotCandidate): boolean {
+  return candidate.loaded.changed
+    || candidate.normalized.changed
+    || candidate.snapshot.schemaVersion !== 2
+    || !isNonNegativeSafeInteger(candidate.snapshot.revision);
+}
+
+function compareSnapshotFreshness(left: LegacySnapshot, right: LegacySnapshot): number {
+  const leftHasRevision = isNonNegativeSafeInteger(left.revision);
+  const rightHasRevision = isNonNegativeSafeInteger(right.revision);
+  if (leftHasRevision && rightHasRevision) {
+    return left.revision! === right.revision! ? 0 : left.revision! > right.revision! ? 1 : -1;
+  }
+  if (leftHasRevision) return 1;
+  if (rightHasRevision) return -1;
+  const leftSequence = asFiniteNumber(left.nextSequence, 0);
+  const rightSequence = asFiniteNumber(right.nextSequence, 0);
+  return leftSequence === rightSequence ? 0 : leftSequence > rightSequence ? 1 : -1;
+}
+
 function canRechunkPendingItem(item: OutboxItem): boolean {
   return item.state === 'pending'
     && !item.deliveryReceipt
@@ -635,11 +856,14 @@ function decodeDeliveryState(
   value: Partial<OutboxItem>,
   index: number,
   strictSchemaTwo: boolean,
+  now: number,
 ): DecodedDeliveryState {
   if (!strictSchemaTwo) {
+    const ambiguous = value.recoveryRequired === true;
+    const terminal = value.state === 'permanent-failure' || ambiguous;
     return {
       priority: isOutboxPriority(value.priority) ? value.priority : 'final',
-      state: value.state === 'permanent-failure' ? 'permanent-failure' : 'pending',
+      state: terminal ? 'permanent-failure' : 'pending',
       ...(isValidDeliveryReceipt(value.deliveryReceipt)
         ? { deliveryReceipt: {
             reservationId: value.deliveryReceipt.reservationId,
@@ -647,7 +871,12 @@ function decodeDeliveryState(
           } }
         : {}),
       ...(value.continuationNoticeAttached ? { continuationNoticeAttached: true } : {}),
-      ...(value.recoveryRequired ? { recoveryRequired: true } : {}),
+      ...(terminal ? {
+        failureKind: ambiguous ? 'ambiguous-delivery' : 'legacy-unknown',
+        failedAt: now,
+        recoveryAttempts: 0,
+      } : {}),
+      changed: terminal,
     };
   }
 
@@ -682,19 +911,65 @@ function decodeDeliveryState(
     );
   }
 
+  const hasFailureKind = Object.hasOwn(raw, 'failureKind');
+  if (hasFailureKind && !isOutboxFailureKind(raw.failureKind)) {
+    throw new OutboxMigrationError(`invalid schema-two item at index ${index}: unknown failureKind`);
+  }
+  const hasFailedAt = Object.hasOwn(raw, 'failedAt');
+  if (hasFailedAt && (typeof raw.failedAt !== 'number'
+    || !Number.isFinite(raw.failedAt)
+    || raw.failedAt < 0)) {
+    throw new OutboxMigrationError(`invalid schema-two item at index ${index}: failedAt must be finite and non-negative`);
+  }
+  const hasRecoveryAttempts = Object.hasOwn(raw, 'recoveryAttempts');
+  if (hasRecoveryAttempts && (!Number.isSafeInteger(raw.recoveryAttempts)
+    || (raw.recoveryAttempts as number) < 0)) {
+    throw new OutboxMigrationError(
+      `invalid schema-two item at index ${index}: recoveryAttempts must be a non-negative safe integer`,
+    );
+  }
+
+  const legacyAmbiguous = raw.recoveryRequired === true;
+  const terminal = value.state === 'permanent-failure' || legacyAmbiguous;
+  const failureKind = terminal
+    ? (legacyAmbiguous ? 'ambiguous-delivery' : (raw.failureKind as OutboxFailureKind | undefined)
+      ?? 'legacy-unknown')
+    : raw.failureKind as OutboxFailureKind | undefined;
+  const failedAt = terminal
+    ? (hasFailedAt ? raw.failedAt as number : now)
+    : (hasFailedAt ? raw.failedAt as number : undefined);
+  const recoveryAttempts = terminal
+    ? (hasRecoveryAttempts ? raw.recoveryAttempts as number : 0)
+    : (hasRecoveryAttempts ? raw.recoveryAttempts as number : undefined);
+  const changed = legacyAmbiguous
+    || (terminal && (!hasFailureKind || !hasFailedAt || !hasRecoveryAttempts));
+
   return {
     priority: value.priority,
-    state: value.state,
+    state: terminal ? 'permanent-failure' : value.state,
     ...(decodedReceipt ? { deliveryReceipt: decodedReceipt } : {}),
     ...(hasContinuationNotice
       ? { continuationNoticeAttached: raw.continuationNoticeAttached as boolean }
       : {}),
-    ...(hasRecoveryRequired ? { recoveryRequired: raw.recoveryRequired as boolean } : {}),
+    ...(hasRecoveryRequired && !legacyAmbiguous
+      ? { recoveryRequired: raw.recoveryRequired as boolean }
+      : {}),
+    ...(failureKind ? { failureKind } : {}),
+    ...(failedAt !== undefined ? { failedAt } : {}),
+    ...(recoveryAttempts !== undefined ? { recoveryAttempts } : {}),
+    changed,
   };
 }
 
 function isOutboxPriority(value: unknown): value is OutboxPriority {
   return typeof value === 'string' && OUTBOX_PRIORITIES.has(value as OutboxPriority);
+}
+
+function isOutboxFailureKind(value: unknown): value is OutboxFailureKind {
+  return value === 'expired-before-delivery'
+    || value === 'deterministic-rejection'
+    || value === 'ambiguous-delivery'
+    || value === 'legacy-unknown';
 }
 
 function isValidDeliveryReceipt(value: unknown): value is NonNullable<OutboxItem['deliveryReceipt']> {
@@ -708,6 +983,18 @@ function isValidDeliveryReceipt(value: unknown): value is NonNullable<OutboxItem
 
 function asFiniteNumber(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function nonNegativeSafeIntegerOption(name: string, value: number | undefined, fallback: number): number {
+  const normalized = value ?? fallback;
+  if (!Number.isSafeInteger(normalized) || normalized < 0) {
+    throw new OutboxMigrationError(`invalid ${name}: expected a non-negative safe integer`);
+  }
+  return normalized;
 }
 
 function asPositiveSafeInteger(value: unknown): number | undefined {
@@ -749,7 +1036,7 @@ function assertPersistableItems(items: Map<string, OutboxItem>): void {
     if (typeof item.text !== 'string') {
       throw new OutboxMigrationError(`invalid schema-two item at index ${index}: text must be a string`);
     }
-    decodeDeliveryState(item, index, true);
+    decodeDeliveryState(item, index, true, Date.now());
     index += 1;
   }
 }
