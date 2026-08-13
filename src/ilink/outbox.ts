@@ -13,6 +13,18 @@ export type OutboxFailureKind =
   | 'ambiguous-delivery'
   | 'legacy-unknown';
 
+// Failure kinds whose send either provably never reached iLink or left the
+// outcome unknown. Both are safe to requeue because the frozen client_id is
+// reused verbatim, so iLink de-duplicates a send that did land. Deterministic
+// rejections (4xx) and legacy-unknown records stay terminal: replaying them
+// cannot succeed, and their original failure reason is no longer trustworthy.
+export type RecoverableFailureKind = 'expired-before-delivery' | 'ambiguous-delivery';
+
+const RECOVERABLE_FAILURE_KINDS = new Set<OutboxFailureKind>([
+  'expired-before-delivery',
+  'ambiguous-delivery',
+]);
+
 export interface OutboxError {
   ret?: number;
   errcode?: number;
@@ -77,7 +89,7 @@ export interface OutboxOptions {
 
 export interface OutboxRecovery {
   itemId: string;
-  kind: 'expired-before-delivery';
+  kind: RecoverableFailureKind;
   ageMs: number;
   attempt: number;
 }
@@ -405,7 +417,7 @@ export class OutboxStore {
     return changed;
   }
 
-  recoverExpiredFailures(accountId: string, userId: string): OutboxRecovery[] {
+  recoverRetryableFailures(accountId: string, userId: string): OutboxRecovery[] {
     const nextItems = new Map(this.items);
     const expiredOrPruned = this.expireAndPrune(nextItems);
     const now = this.now();
@@ -414,7 +426,8 @@ export class OutboxStore {
         && item.userId === userId
         && item.state === 'permanent-failure'
         && !item.deliveryReceipt
-        && item.failureKind === 'expired-before-delivery'
+        && item.failureKind !== undefined
+        && RECOVERABLE_FAILURE_KINDS.has(item.failureKind)
         && (item.recoveryAttempts ?? 0) < MAX_RECOVERY_ATTEMPTS
         && item.failedAt !== undefined
         && now - item.failedAt >= 0
@@ -436,11 +449,21 @@ export class OutboxStore {
     for (const item of eligible) {
       if (activeCount + 1 > this.maxItemsPerUser
         || activeBytes + item.bytes > this.maxBytesPerUser) break;
-      const sequence = asPositiveSafeInteger(nextSequence);
-      if (sequence === undefined) throw sequenceCapacityError();
-      nextSequence = nextSafeSequence(sequence);
       const attempt = (item.recoveryAttempts ?? 0) + 1;
       const ageMs = now - item.failedAt!;
+      const kind = item.failureKind as RecoverableFailureKind;
+      // An ambiguous item failed mid-reply and the chunks queued behind it were
+      // never sent, so it keeps its original sequence and Map position and the
+      // suffix still follows it. An expired straggler is stale by definition,
+      // so it appends to the tail instead of preceding a fresh reply.
+      const keepsPosition = kind === 'ambiguous-delivery';
+      let sequence = item.sequence;
+      if (!keepsPosition) {
+        const tail = asPositiveSafeInteger(nextSequence);
+        if (tail === undefined) throw sequenceCapacityError();
+        nextSequence = nextSafeSequence(tail);
+        sequence = tail;
+      }
       const requeued: OutboxItem = {
         ...item,
         sequence,
@@ -452,11 +475,11 @@ export class OutboxStore {
       delete requeued.terminalError;
       delete requeued.failureKind;
       delete requeued.failedAt;
-      nextItems.delete(item.itemId);
+      if (!keepsPosition) nextItems.delete(item.itemId);
       nextItems.set(item.itemId, requeued);
       activeCount += 1;
       activeBytes += item.bytes;
-      recovered.push({ itemId: item.itemId, kind: 'expired-before-delivery', ageMs, attempt });
+      recovered.push({ itemId: item.itemId, kind, ageMs, attempt });
     }
 
     if (expiredOrPruned || recovered.length > 0) {

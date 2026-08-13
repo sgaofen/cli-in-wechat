@@ -416,7 +416,7 @@ export class ILinkClient {
     // Cache context_token for this user
     if (msg.context_token) this.contextTokens.set(msg.from_user_id, msg.context_token);
     this.persistContextTokens();
-    const recovered = this.outbox.recoverExpiredFailures(this.accountId, msg.from_user_id);
+    const recovered = this.outbox.recoverRetryableFailures(this.accountId, msg.from_user_id);
     for (const item of recovered) {
       this.diagnostics.record({
         event: 'outbox-recovery',
@@ -729,12 +729,17 @@ export class ILinkClient {
         } else if (classified?.status === 'permanent-failure') {
           this.outbox.markPermanentFailure(frozen.itemId, details, 'deterministic-rejection');
           results.push(this.resultForItem(frozen, 'permanent-failure', details));
+          // A deterministic rejection can never succeed on replay, so releasing
+          // the FIFO suffix here is the only way the rest of the reply ships.
+          continue;
         } else {
           this.outbox.markAmbiguous(frozen.itemId, details);
           results.push(this.resultForItem(frozen, 'ambiguous', details));
         }
-        if (classified?.status === 'rate-limited') break;
-        continue;
+        // Rate limiting and ambiguous outcomes both stop the drain: the items
+        // behind this one are still deliverable, and shipping them now would
+        // reorder a chunked reply around an item that a later inbound requeues.
+        break;
       }
 
       try {

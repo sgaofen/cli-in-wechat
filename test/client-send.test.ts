@@ -305,7 +305,7 @@ test('keeps all streamed body chunks ahead of a final footer across windows', as
   });
 });
 
-test('ambiguous response preserves frozen identity but never retries on a later inbound', async () => {
+test('ambiguous response holds terminal until a later inbound requeues the frozen identity', async () => {
   const client = new ILinkClient(CREDS, paths());
   await (client as any).processMessage(message(1));
   const outbox = (client as any).outbox;
@@ -330,11 +330,15 @@ test('ambiguous response preserves frozen identity but never retries on a later 
       assert.equal(client.getDeliveryState('user-a').state, 'PERMANENT_FAILURE');
     });
 
+    // A fresh inbound is the recovery trigger: the item is requeued and resent
+    // under the same client_id, so iLink drops it if the first send did land.
     await withFetchResponses([{ ret: 0 }], async (retryRequests) => {
       await processInboundAndRecover(client, message(2));
-      assert.equal(retryRequests.length, 0);
+      assert.equal(retryRequests.length, 1);
+      assert.equal(retryRequests[0].body.msg.client_id, firstClientId);
+      assert.equal(retryRequests[0].body.msg.item_list[0].text_item.text, 'body');
       assert.equal(outbox.listPending('user-a').length, 0);
-      assert.equal(outbox.get('ambiguous-final')?.clientId, firstClientId);
+      assert.equal(client.getDeliveryStatus('user-a').failed.length, 0);
     });
   });
 });
@@ -739,7 +743,7 @@ test('a fresh inbound during an in-flight confirmed send does not relabel it amb
   }
 });
 
-test('non-rate ret=-2 is terminal ambiguous and remains durable without retry', async () => {
+test('non-rate ret=-2 is ambiguous and parks durably without an immediate retry', async () => {
   const client = new ILinkClient(CREDS, paths());
   await (client as any).processMessage(message(1));
   await withFetchResponses([{ ret: -2, errmsg: 'temporary scheduler failure' }], async (requests) => {
@@ -923,7 +927,7 @@ test('recovery diagnostics report one truthful event per recovered item', async 
   ]);
 });
 
-test('restart never resends the ambiguous item and resumes only its pending suffix', async () => {
+test('restart resends the ambiguous chunk ahead of the suffix queued behind it', async () => {
   const options = paths();
   const first = new ILinkClient(CREDS, options);
   await (first as any).processMessage(message(1));
@@ -941,20 +945,21 @@ test('restart never resends the ambiguous item and resumes only its pending suff
     ...Array.from({ length: 6 }, () => ({ ret: 0 })),
   ];
   await withFetchResponses(responses, async (requests) => {
+    // An ambiguous outcome stops the drain: chunks 9-13 are still deliverable
+    // and must not ship around the chunk a later inbound requeues.
     const firstResult = await first.recoverPending('user-a');
-    assert.equal(firstResult.filter((result) => result.status === 'sent').length, 9);
-    assert.equal(firstResult.find((result) => result.status === 'ambiguous')?.itemId, 'restart-seven-8');
+    assert.equal(firstResult.filter((result) => result.status === 'sent').length, 7);
+    assert.equal(firstResult.at(-1)?.status, 'ambiguous');
+    assert.equal(firstResult.at(-1)?.itemId, 'restart-seven-8');
+    assert.equal(requests.length, 8);
     const ambiguousClientId = requests[7].body.msg.client_id;
 
     const restarted = new ILinkClient(CREDS, options);
     await processInboundAndRecover(restarted, message(2));
-    assert.equal(
-      requests.filter((request) => request.body.msg.client_id === ambiguousClientId).length,
-      1,
-    );
+    assert.equal(requests[8].body.msg.client_id, ambiguousClientId);
+    assert.equal(requests.length, 14);
     assert.equal(restarted.getDeliveryStatus('user-a').pending.length, 0);
-    assert.equal(restarted.getDeliveryStatus('user-a').failed[0].itemId, 'restart-seven-8');
-    assert.equal(restarted.getDeliveryStatus('user-a').failed[0].failureKind, 'ambiguous-delivery');
+    assert.equal(restarted.getDeliveryStatus('user-a').failed.length, 0);
   });
 });
 
