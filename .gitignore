@@ -6,6 +6,9 @@ dist/
 # Runtime data
 .wx-ai-bridge/
 .wx-media/
+config.json
+bridge-run.*.log
+bridge-run.log
 
 # IDE / editor config
 .vscode/
