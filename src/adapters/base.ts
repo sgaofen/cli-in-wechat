@@ -129,6 +129,8 @@ export interface CLIAdapter {
   readonly capabilities: AdapterCapabilities;
   isAvailable(): Promise<boolean>;
   execute(prompt: string, opts: ExecOptions): Promise<ExecResult>;
+  /** Release any long-lived resources (e.g. spawned background servers) on shutdown. */
+  close?(): void;
 }
 
 // ─── Shared process helpers ────────────────────────────────

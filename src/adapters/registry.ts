@@ -100,4 +100,11 @@ export class AdapterRegistry {
   getAll(): CLIAdapter[] {
     return Array.from(this.adapters.values());
   }
+
+  /** Release long-lived adapter resources (e.g. background servers) on shutdown. */
+  shutdown(): void {
+    for (const adapter of this.adapters.values()) {
+      try { adapter.close?.(); } catch { /* ignore */ }
+    }
+  }
 }

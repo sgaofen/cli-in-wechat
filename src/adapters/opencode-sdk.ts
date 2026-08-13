@@ -108,6 +108,13 @@ function extractResultFromParts(parts: Part[]): { text: string; thinking: string
 let sharedClient: import('@opencode-ai/sdk').OpencodeClient | null = null;
 let sharedServerClose: (() => void) | null = null;
 
+/** Stop the opencode server this adapter spawned (no-op when connecting to an existing one). */
+export function closeOpenCodeServer(): void {
+  sharedServerClose?.();
+  sharedServerClose = null;
+  sharedClient = null;
+}
+
 async function getOrCreateClient(): Promise<import('@opencode-ai/sdk').OpencodeClient> {
   if (sharedClient) return sharedClient;
 
@@ -146,6 +153,10 @@ export class OpenCodeAdapter implements CLIAdapter {
   };
 
   async isAvailable(): Promise<boolean> { return commandExists(this.command); }
+
+  close(): void {
+    closeOpenCodeServer();
+  }
 
 private resolveModelArg(model: string, workDir?: string): string {
     const raw = model.trim().replace(/\/+$/, '');
