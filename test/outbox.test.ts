@@ -1717,7 +1717,7 @@ test('capacity pressure never evicts queued activity for a final result', () => 
   ]);
 });
 
-test('recovers only recent expired failures whose attempt backoff elapsed', () => {
+test('recovers only recent retryable failures whose attempt backoff elapsed', () => {
   const minute = 60_000;
   const day = 24 * 60 * minute;
   const now = 20 * day;
@@ -1770,14 +1770,18 @@ test('recovers only recent expired failures whose attempt backoff elapsed', () =
   }));
   const store = new OutboxStore(filePath, { now: () => now, failedRetentionMs: 30 * day });
 
-  const recovered = store.recoverExpiredFailures('account-a', 'user-a');
+  const recovered = store.recoverRetryableFailures('account-a', 'user-a');
 
   assert.deepEqual(recovered, [
     { itemId: 'eligible-first', kind: 'expired-before-delivery', ageMs: 0, attempt: 1 },
     { itemId: 'eligible-second', kind: 'expired-before-delivery', ageMs: 5 * minute, attempt: 2 },
     { itemId: 'eligible-third', kind: 'expired-before-delivery', ageMs: 30 * minute, attempt: 3 },
+    { itemId: 'ambiguous', kind: 'ambiguous-delivery', ageMs: day, attempt: 1 },
   ]);
+  // The ambiguous item holds its original sequence, so it precedes the expired
+  // stragglers that were appended to the tail.
   assert.deepEqual(store.listPending('user-a').map((item) => item.itemId), [
+    'ambiguous',
     'eligible-first',
     'eligible-second',
     'eligible-third',
@@ -1789,7 +1793,6 @@ test('recovers only recent expired failures whose attempt backoff elapsed', () =
     'attempts-exhausted',
     'too-old',
     'deterministic',
-    'ambiguous',
     'legacy',
     'receipt-failure',
   ]);
@@ -1807,7 +1810,7 @@ test('recovered failures append to the active FIFO tail in stable relative order
   assert.equal(store.get(expiredFirst.itemId)?.state, 'permanent-failure');
   assert.equal(store.get(expiredSecond.itemId)?.state, 'permanent-failure');
 
-  const recovered = store.recoverExpiredFailures('account-a', 'user-a');
+  const recovered = store.recoverRetryableFailures('account-a', 'user-a');
 
   assert.deepEqual(recovered.map((item) => item.itemId), ['expired-first', 'expired-second']);
   assert.deepEqual(store.listPending('user-a').map((item) => item.itemId), [
@@ -1835,6 +1838,62 @@ test('recovered failures append to the active FIFO tail in stable relative order
     reloaded.listPending('user-a').slice(-2).map((item) => item.recoveryAttempts),
     [1, 1],
   );
+});
+
+test('a recovered ambiguous item stays ahead of the reply chunks queued behind it', () => {
+  let now = 1_000;
+  const filePath = tempPath();
+  const store = new OutboxStore(filePath, { now: () => now, defaultTtlMs: 100 });
+  const first = store.enqueue(input({ itemId: 'chunk-1', text: 'chunk one' }));
+  const ambiguous = store.enqueue(input({ itemId: 'chunk-2', text: 'chunk two' }));
+  const third = store.enqueue(input({ itemId: 'chunk-3', text: 'chunk three' }));
+  store.ack(first.itemId);
+  assert.equal(store.markAmbiguous(ambiguous.itemId, { errmsg: 'socket hang up' }), true);
+  assert.equal(store.get(ambiguous.itemId)?.failureKind, 'ambiguous-delivery');
+
+  const recovered = store.recoverRetryableFailures('account-a', 'user-a');
+
+  assert.deepEqual(recovered, [
+    { itemId: 'chunk-2', kind: 'ambiguous-delivery', ageMs: 0, attempt: 1 },
+  ]);
+  assert.deepEqual(store.listPending('user-a').map((item) => item.itemId), ['chunk-2', 'chunk-3']);
+  const requeued = store.get(ambiguous.itemId);
+  assert.equal(requeued?.state, 'pending');
+  assert.equal(requeued?.sequence, ambiguous.sequence);
+  assert.ok(requeued!.sequence < third.sequence);
+  // The frozen client_id is what makes the resend safe: iLink de-duplicates a
+  // send that did land, so an ambiguous outcome never doubles a message.
+  assert.equal(requeued?.clientId, ambiguous.clientId);
+  assert.equal(requeued?.text, ambiguous.text);
+  assert.equal(requeued?.recoveryAttempts, 1);
+  assert.equal(requeued?.terminalError, undefined);
+  assert.equal(requeued?.failureKind, undefined);
+
+  const reloaded = new OutboxStore(filePath, { now: () => now, defaultTtlMs: 100 });
+  assert.deepEqual(reloaded.listPending('user-a').map((item) => item.itemId), ['chunk-2', 'chunk-3']);
+});
+
+test('an ambiguous item stops recovering once its attempt budget is spent', () => {
+  const day = 24 * 60 * 60_000;
+  let now = 1_000;
+  const store = new OutboxStore(tempPath(), { now: () => now, defaultTtlMs: 10 * day });
+  const item = store.enqueue(input({ itemId: 'ambiguous-budget', text: 'body' }));
+
+  // Each round clears the longest configured backoff step before retrying.
+  for (const expected of [1, 2, 3]) {
+    assert.equal(store.markAmbiguous(item.itemId, { errmsg: 'socket hang up' }), true);
+    now += 30 * 60_000;
+    assert.deepEqual(
+      store.recoverRetryableFailures('account-a', 'user-a').map((entry) => entry.attempt),
+      [expected],
+    );
+  }
+
+  assert.equal(store.markAmbiguous(item.itemId, { errmsg: 'socket hang up' }), true);
+  now += 30 * 60_000;
+  assert.deepEqual(store.recoverRetryableFailures('account-a', 'user-a'), []);
+  assert.equal(store.get(item.itemId)?.state, 'permanent-failure');
+  assert.equal(store.get(item.itemId)?.failureKind, 'ambiguous-delivery');
 });
 
 test('accepts zero terminal retention budgets and immediately drops failures', () => {
@@ -1880,16 +1939,16 @@ test('restart preserves recovery attempts and enforces the next backoff', () => 
   const first = new OutboxStore(filePath, { now: () => now, defaultTtlMs: 100 });
   first.enqueue(input({ itemId: 'retry-after-restart', ttlMs: 1 }));
   now += 1;
-  assert.equal(first.recoverExpiredFailures('account-a', 'user-a')[0]?.attempt, 1);
+  assert.equal(first.recoverRetryableFailures('account-a', 'user-a')[0]?.attempt, 1);
 
   now += 100;
   const restarted = new OutboxStore(filePath, { now: () => now, defaultTtlMs: 100 });
   assert.equal(restarted.get('retry-after-restart')?.state, 'permanent-failure');
   assert.equal(restarted.get('retry-after-restart')?.recoveryAttempts, 1);
-  assert.deepEqual(restarted.recoverExpiredFailures('account-a', 'user-a'), []);
+  assert.deepEqual(restarted.recoverRetryableFailures('account-a', 'user-a'), []);
 
   now += 5 * 60_000;
-  assert.equal(restarted.recoverExpiredFailures('account-a', 'user-a')[0]?.attempt, 2);
+  assert.equal(restarted.recoverRetryableFailures('account-a', 'user-a')[0]?.attempt, 2);
 });
 
 test('an item first observed long after expiry is too old to auto-recover', () => {
@@ -1904,7 +1963,7 @@ test('an item first observed long after expiry is too old to auto-recover', () =
   now += 14 * day + 2;
 
   assert.equal(store.get(item.itemId)?.failureKind, 'expired-before-delivery');
-  assert.deepEqual(store.recoverExpiredFailures('account-a', 'user-a'), []);
+  assert.deepEqual(store.recoverRetryableFailures('account-a', 'user-a'), []);
   assert.equal(store.get(item.itemId)?.state, 'permanent-failure');
 });
 

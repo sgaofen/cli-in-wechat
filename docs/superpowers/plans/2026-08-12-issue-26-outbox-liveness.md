@@ -321,3 +321,30 @@ If verification exposes a defect, first add or identify the failing focused test
 Run: `git push --set-upstream origin codex/fix-outbox-terminal-capacity`
 
 Expected: origin tracking is configured and the remote SHA matches local `HEAD`. Do not create a pull request; independent dual review occurs first.
+
+---
+
+## Amendment (post-merge follow-up)
+
+This plan terminalized `ambiguous-delivery` permanently and released the FIFO
+suffix after every terminal failure. Shipped behavior now differs on two points:
+
+1. **`ambiguous-delivery` is retryable, not terminal.** It runs through the same
+   bounded recovery as `expired-before-delivery` (max 3 attempts, 0/5min/30min
+   backoff, 14-day age cap). The reason is that `classifyApiFailure` routes 5xx,
+   408/425, `ret=-2`, and every transport error that outlives `fetchWithRetry`
+   into this class. Making them terminal meant a WeChat outage or a dropped link
+   silently discarded the reply with no recovery entry point anywhere in the
+   codebase — the exact complaint Issue #26 opened with. The resend is safe
+   because the frozen `client_id` is reused verbatim, so iLink de-duplicates a
+   send that did land. `deterministic-rejection` and `legacy-unknown` stay
+   terminal as planned.
+
+2. **Only `deterministic-rejection` releases the FIFO suffix.** Ambiguous
+   outcomes `break` the drain alongside rate limiting. A 4xx item can never
+   succeed, so blocking the suffix on it is pure loss; an ambiguous item is
+   still deliverable, and shipping the chunks behind it would reorder a chunked
+   reply around the chunk a later inbound requeues.
+
+A recovered ambiguous item keeps its original sequence and queue position;
+expired stragglers still append to the tail.
