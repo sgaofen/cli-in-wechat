@@ -60,8 +60,11 @@ function emitToolStateEvents(
   if (!onIntermediate) return;
 
   switch (state.status) {
-    case 'pending':
     case 'running':
+      // `pending` is skipped on purpose: it carries no input yet, so emitting it would
+      // produce a second, argument-less `- Tool` line for the same call (OpenCode sends
+      // pending then running for every tool). Emitting only `running` yields exactly one
+      // line per tool, matching the Claude adapter's behavior.
       onIntermediate({
         type: 'tool_use',
         content: summarizeToolUse(toolName, state.input),
