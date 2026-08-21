@@ -1,4 +1,5 @@
 import { log } from '../utils/logger.js';
+import { DEFAULT_CLI_TIMEOUT } from '../config.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities, IntermediateMessage } from './base.js';
 import { commandExists, spawnProc, setupAbort, setupTimeout, stripAnsi, summarizeToolUse, summarizeToolResult } from './base.js';
 import type { DownloadedMedia } from '../utils/media.js';
@@ -397,7 +398,7 @@ private resolveModelArg(model: string, workDir?: string): string {
 
     // Wait for completion (poll session status or use timeout)
     const start = Date.now();
-    const timeout = opts.timeout || 300_000;
+    const timeout = opts.timeout || DEFAULT_CLI_TIMEOUT;
 
     while (!finished && (Date.now() - start) < timeout) {
       if (signal?.aborted) {

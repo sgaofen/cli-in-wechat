@@ -119,7 +119,7 @@ export class ClaudeAdapter implements CLIAdapter {
     // so a long-but-healthy agent run is never cut off, while one that has stopped
     // producing output is aborted after `timeout` of silence. A total-duration cap would
     // be wrong here — unlike the other adapters, the SDK path is Claude's primary path
-    // (the CLI is only a fallback), so capping it at cliTimeout (5 min by default) would
+    // (the CLI is only a fallback), so capping it at cliTimeout (1 h by default) would
     // kill ordinary multi-step work. Idle is also what the message below promises.
     const sdkAbort = new AbortController();
     let abortTimer: ReturnType<typeof setTimeout> | null = null;
