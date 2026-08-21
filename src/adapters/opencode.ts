@@ -2,6 +2,7 @@ import { log } from '../utils/logger.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
 import { commandExists, spawnCli, setupAbort, setupTimeout, stripAnsi, buildMediaPrompt, collectUtf8, writeStdin } from './base.js';
 import { execSync } from 'node:child_process';
+import { parseOpenCodeJsonl } from './opencode-jsonl.js';
 
 const modelResolveCache = new Map<string, string>();
 
@@ -28,14 +29,18 @@ export function resolveMiniMaxThinkingVariant(model: string, effort: string): st
   return effort.trim().toLowerCase() === 'low' ? 'none' : 'thinking';
 }
 
+export type OpenCodeSpawn = typeof spawnCli;
+
 export class OpenCodeAdapter implements CLIAdapter {
   readonly name = 'opencode';
   readonly displayName = 'OpenCode';
   readonly command = 'opencode';
   readonly capabilities: AdapterCapabilities = {
-    streaming: false, jsonOutput: true, sessionResume: true,
+    streaming: true, jsonOutput: true, sessionResume: true,
     modes: ['auto', 'safe', 'plan'], hasEffort: true, hasModel: true, hasSearch: false, hasBudget: false,
   };
+
+  constructor(private readonly spawnOpenCode: OpenCodeSpawn = spawnCli) {}
 
   async isAvailable(): Promise<boolean> { return commandExists(this.command); }
 
@@ -105,7 +110,7 @@ private resolveModelArg(model: string, workDir?: string): string {
 
       log.debug(`[opencode] executing: ${args.join(' ')}`);
 
-      const proc = spawnCli(this.command, args, {
+      const proc = this.spawnOpenCode(this.command, args, {
         cwd: settings.workDir || opts.workDir,
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env },
@@ -126,42 +131,31 @@ private resolveModelArg(model: string, workDir?: string): string {
         log.debug(`[opencode] stdout length: ${stdout.length}, first 500 chars: ${stdout.substring(0, 500)}`);
 
         try {
-          let text = '';
-          let thinking = '';
-          let sessionId: string | undefined;
-          let hasError = code !== 0;
+          const onIntermediate = settings.msgMode !== 'compact'
+            ? opts.onIntermediate
+            : undefined;
+          const parsed = parseOpenCodeJsonl(stdout, onIntermediate);
+          const hasError = code !== 0 || parsed.hasError;
 
-          const lines = stdout.trim().split('\n');
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            try {
-              const obj = JSON.parse(line);
-              if (obj.type === 'text' && obj.part?.text) {
-                text += obj.part.text;
-              }
-              if (obj.type === 'reasoning' && obj.part?.text) {
-                thinking += obj.part.text;
-                log.debug(`[opencode] found reasoning, length: ${obj.part.text.length}`);
-              }
-              if (obj.sessionID && !sessionId) {
-                sessionId = obj.sessionID;
-              }
-              if (obj.type === 'step_finish' && obj.part?.reason === 'error') {
-                hasError = true;
-              }
-            } catch {
-              // ignore parse errors for individual lines
-            }
-          }
-
-          log.debug(`[opencode] final thinking length: ${thinking.length}`);
-          if (text) {
-            resolve({ text, thinking: thinking || undefined, sessionId, error: hasError });
+          log.debug(`[opencode] final thinking length: ${parsed.thinking.length}`);
+          if (parsed.text) {
+            resolve({
+              text: parsed.text,
+              thinking: parsed.thinking || undefined,
+              sessionId: parsed.sessionId,
+              error: hasError,
+            });
           } else {
-            resolve({ text: stripAnsi(stdout.trim() || stderr.trim()) || `exit ${code}`, error: code !== 0 });
+            resolve({
+              text: stripAnsi(stdout.trim() || stderr.trim()) || `exit ${code}`,
+              error: code !== 0,
+            });
           }
         } catch {
-          resolve({ text: stripAnsi(stdout.trim() || stderr.trim()) || `exit ${code}`, error: code !== 0 });
+          resolve({
+            text: stripAnsi(stdout.trim() || stderr.trim()) || `exit ${code}`,
+            error: code !== 0,
+          });
         }
       });
       proc.on('error', (err) => {

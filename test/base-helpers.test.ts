@@ -3,7 +3,14 @@ import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 import { spawn } from 'node:child_process';
 
-import { collectUtf8, writeStdin, buildMediaPrompt, killProc } from '../src/adapters/base.js';
+import {
+  collectUtf8,
+  writeStdin,
+  buildMediaPrompt,
+  killProc,
+  summarizeToolUse,
+  summarizeToolResult,
+} from '../src/adapters/base.js';
 import type { DownloadedMedia } from '../src/utils/media.js';
 
 // ─── collectUtf8: multibyte UTF-8 must survive chunk boundaries ──────────────
@@ -95,4 +102,27 @@ test('killProc: actually terminates a live child (POSIX)', { skip: process.platf
   killProc(child);
   const result = await exited;
   assert.equal(result, -1, 'child was killed by signal');
+});
+
+test('summarizeToolUse preserves the historical Claude/OpenCode activity labels', () => {
+  assert.equal(
+    summarizeToolUse('bash', { command: 'npm   test' }),
+    '- Shell Command: `npm test`',
+  );
+  assert.equal(
+    summarizeToolUse('read', { file_path: 'C:\\repo\\src\\index.ts' }),
+    '- Read File: `index.ts`',
+  );
+  assert.equal(
+    summarizeToolUse('websearch', { query: 'OpenCode JSONL events' }),
+    '- WebSearch: `OpenCode JSONL events`',
+  );
+  assert.equal(summarizeToolUse('unknown-tool', {}), '- unknown-tool');
+});
+
+test('summarizeToolResult emits only the historical curated result summaries', () => {
+  assert.equal(summarizeToolResult('bash', 'Exit code 0\nhello'), '  ↳ Exit: 0');
+  assert.equal(summarizeToolResult('webfetch', 'HTTP: 404'), '  ↳ HTTP: 404');
+  assert.equal(summarizeToolResult('read', 'secret file contents'), '');
+  assert.equal(summarizeToolResult('unknown-tool', 'large noisy output'), '');
 });

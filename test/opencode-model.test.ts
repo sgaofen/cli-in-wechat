@@ -10,6 +10,10 @@ test('OpenCode advertises model effort control', () => {
   assert.equal(new OpenCodeAdapter().capabilities.hasEffort, true);
 });
 
+test('OpenCode advertises streaming activity', () => {
+  assert.equal(new OpenCodeAdapter().capabilities.streaming, true);
+});
+
 test('resolveBareModelFromList keeps provider/model as-is', () => {
   const model = resolveBareModelFromList('baiduqianfancodingplan/glm-5', [
     'baiduqianfancodingplan/glm-5',

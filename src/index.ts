@@ -140,6 +140,7 @@ async function main() {
     log.info(`收到 ${signal}，正在关闭...`);
     try { router.stop(); } catch { /* ignore */ }
     try { ilink.stop(); } catch { /* ignore */ }
+    try { registry.shutdown(); } catch { /* ignore */ }
     void releaseInstance?.();
     releaseInstance = null;
     // Give in-flight aborts (child SIGTERM/taskkill) a brief moment, then exit.
@@ -161,6 +162,7 @@ async function main() {
       shuttingDown = true;
       try { router.stop(); } catch { /* ignore */ }
       try { ilink.stop(); } catch { /* ignore */ }
+      try { registry.shutdown(); } catch { /* ignore */ }
       void releaseInstance?.();
       releaseInstance = null;
     }

@@ -47,10 +47,14 @@ export interface BridgeConfig {
 
 export const DEFAULT_MAX_RESPONSE_CHUNK_BYTES = 3_800;
 
+// 1 hour. Long agent tasks (e.g. OpenCode subagent research) routinely exceed the
+// previous 5-minute default; the OpenCode server path caps total duration at this value.
+export const DEFAULT_CLI_TIMEOUT = 3_600_000;
+
 const DEFAULT_CONFIG: BridgeConfig = {
   defaultTool: 'claude',
   maxResponseChunkSize: DEFAULT_MAX_RESPONSE_CHUNK_BYTES,
-  cliTimeout: 300_000,      // 5 minutes
+  cliTimeout: DEFAULT_CLI_TIMEOUT,
   typingInterval: 5_000,    // 5 seconds
   allowedUsers: [],
   allowAllUsers: false,
