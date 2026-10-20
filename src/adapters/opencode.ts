@@ -2,6 +2,7 @@ import { log } from '../utils/logger.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
 import { commandExists, spawnCli, setupAbort, setupTimeout, stripAnsi, buildMediaPrompt, collectUtf8, writeStdin } from './base.js';
 import { execSync } from 'node:child_process';
+import { flashEffortVariant, isMiniMaxFlash } from './opencode-models.js';
 
 const modelResolveCache = new Map<string, string>();
 
@@ -37,7 +38,26 @@ export class OpenCodeAdapter implements CLIAdapter {
     modes: ['auto', 'safe', 'plan'], hasEffort: true, hasModel: true, hasSearch: false, hasBudget: false,
   };
 
+  constructor(private readonly spawnOpenCode: typeof spawnCli = spawnCli) {}
+
   async isAvailable(): Promise<boolean> { return commandExists(this.command); }
+
+  private resolveVariant(model: string, effort: string, workDir?: string): string | undefined {
+    if (!isMiniMaxFlash(model)) return resolveMiniMaxThinkingVariant(model, effort);
+    try {
+      const catalog = execSync('opencode models --verbose', {
+        cwd: workDir,
+        encoding: 'utf8',
+        timeout: 5000,
+        maxBuffer: 16 * 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      return flashEffortVariant(model, effort, catalog);
+    } catch {
+      // Older CLIs may not advertise Flash effort variants. Keep their default.
+      return undefined;
+    }
+  }
 
 private resolveModelArg(model: string, workDir?: string): string {
     const raw = model.trim().replace(/\/+$/, '');
@@ -92,7 +112,7 @@ private resolveModelArg(model: string, workDir?: string): string {
       if (settings.model) {
         const resolvedModel = this.resolveModelArg(settings.model, settings.workDir || opts.workDir);
         args.push('-m', resolvedModel);
-        const variant = resolveMiniMaxThinkingVariant(resolvedModel, settings.effort);
+        const variant = this.resolveVariant(resolvedModel, settings.effort, workDir);
         if (variant) args.push('--variant', variant);
       }
 
@@ -105,7 +125,7 @@ private resolveModelArg(model: string, workDir?: string): string {
 
       log.debug(`[opencode] executing: ${args.join(' ')}`);
 
-      const proc = spawnCli(this.command, args, {
+      const proc = this.spawnOpenCode(this.command, args, {
         cwd: settings.workDir || opts.workDir,
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env },

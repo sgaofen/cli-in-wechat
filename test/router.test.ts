@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 
 import { Router, createSendFileMarkerStripper } from '../src/bridge/router.js';
 import { DeliveryFinalizationError } from '../src/ilink/client.js';
@@ -104,6 +106,29 @@ function makeMessage(uid: string): WeixinMessage {
     item_list: [],
   };
 }
+
+test('/models shows current MiniMax choices without resetting saved or explicit legacy models', async (t) => {
+  const { router, sessions, messages } = createRouter();
+  const saved = 'minimax/MiniMax-M2.7';
+  await router.handleSlash('u1', `/model ${saved}`);
+  t.mock.method(childProcess, 'execSync', (command: string, options: { cwd: string }) => {
+    assert.equal(command, 'opencode models');
+    assert.equal(options.cwd, process.cwd());
+    return 'minimax/MiniMax-M2.7\nminimax/MiniMax-M3\nother/model\nminimax/MiniMax-M3.1-Flash\n';
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  await router.handleSlash('u1', '/models');
+  const displayed = messages.at(-1)!.text;
+  assert.ok(displayed.indexOf('MiniMax-M3.1-Flash') < displayed.indexOf('MiniMax-M3\n'));
+  assert.ok(displayed.includes('other/model'));
+  assert.ok(!displayed.includes('MiniMax-M2.7'));
+  assert.equal((sessions.get('u1') as any).model, saved);
+  await router.handleSlash('u1', '/model custom/model');
+  assert.equal((sessions.get('u1') as any).model, 'custom/model');
+  await router.handleSlash('u1', '/model');
+  assert.equal((sessions.get('u1') as any).model, '');
+});
 
 test('default settings allow up to 100 turns', () => {
   assert.equal(DEFAULT_SETTINGS.maxTurns, 100);

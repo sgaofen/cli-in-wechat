@@ -2,6 +2,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { execSync } from 'node:child_process';
+import { ordinaryOpenCodeModels } from '../adapters/opencode-models.js';
 import { log } from '../utils/logger.js';
 import { ILinkClient, isDeliveryFinalizationError } from '../ilink/client.js';
 import { AdapterRegistry } from '../adapters/registry.js';
@@ -466,11 +467,12 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       case 'models': {
         try {
           const stdout = execSync('opencode models', {
+            cwd: settings.workDir || this.config.workDir,
             encoding: 'utf-8',
             timeout: 5000,
             stdio: ['ignore', 'pipe', 'ignore'],
           });
-          const models = stdout.trim().split(/\r?\n/).filter(Boolean);
+          const models = ordinaryOpenCodeModels(stdout.trim().split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
           await reply(models.length > 0 ? `可用模型 (${models.length}个):\n${models.join('\n')}` : '没有可用的模型');
         } catch (err) {
           await reply(`获取模型列表失败: ${(err as Error).message}`);
